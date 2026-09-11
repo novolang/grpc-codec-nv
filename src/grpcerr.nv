@@ -1,0 +1,140 @@
+// grpcerr — every way a gRPC stream can refuse to be read or written.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// TWO TYPES, BECAUSE THERE ARE TWO AUDIENCES
+//
+// `GrpcDecodeError` is "the peer sent something gRPC does not allow" —
+// a frame longer than the limit, a `grpc-timeout` that is not a number
+// and a unit, a metadata name with an upper-case letter in it, a
+// message that arrived after the trailers.  The protocol says what to
+// do about each: answer a status and close the stream, and
+// `decode_status` is that answer so an endpoint does not have to choose
+// between seventeen codes with a specification open beside it.
+//
+// `GrpcEncodeError` is "you asked me to write something gRPC does not
+// allow" — a message past the limit, a metadata name that is
+// `grpc-`-reserved, a send on a half-closed call.  That is the calling
+// program's fault, there is no status for it, and a caller matching one
+// enum for both would be writing arms it can never reach.
+//
+// NEITHER MEANS "NOT A STATUS OK".  A call that ends `NOT_FOUND` ended
+// correctly: the framing worked, the trailers arrived, and the answer
+// is a `GrpcTrailers` with a status in it.  Confusing a transport fault
+// with an application answer is the single most common mistake in gRPC
+// client code, and keeping them in different types is how this package
+// declines to make it.
+
+// GrpcDecodeError is why a byte stream or a header set is not a
+// well-formed gRPC stream.
+//
+// Every variant that is about bytes carries `at`, the offset from the
+// first byte of the DATA the host handed over — not from the start of
+// the HTTP/2 stream, which this package never sees.
+pub enum GrpcDecodeError
+    // A frame's five-byte header announced more bytes than the call's
+    // limit allows.  Refused before anything is reserved for it,
+    // because a length prefix is an allocation instruction from
+    // whoever sent it.
+    GrpcFrameTooLarge(at: Int, len: Int, limit: Int)
+    // The stream ended in the middle of a frame: `need` more bytes
+    // would have finished it.
+    GrpcFrameTruncated(at: Int, need: Int)
+    // The compressed flag was neither 0 nor 1.  The specification
+    // reserves the other 254 values and no implementation may guess.
+    GrpcBadCompressedFlag(at: Int, flag: Int)
+    // A message arrived with the compressed flag set and the stream
+    // never named an encoding in `grpc-encoding`.
+    GrpcCompressedWithoutEncoding(at: Int)
+    // The `content-type` was not `application/grpc` or one of its
+    // `+subtype` forms.  The specification makes this a specific
+    // refusal rather than a generic one, because it is what a proxy
+    // that stripped the header looks like from here.
+    GrpcBadContentType(value: Str)
+    // A metadata key held a character the protocol does not allow, or
+    // an upper-case letter — HTTP/2 header names are lower case and a
+    // key that is not is a key the far end will not find.
+    GrpcBadMetadataName(name: Str, at: Int)
+    // A `-bin` metadata value was not valid base64.
+    GrpcBadBinaryMetadata(name: Str)
+    // `grpc-timeout` was not up to eight digits followed by one of
+    // `H`, `M`, `S`, `m`, `u`, `n`.
+    GrpcBadTimeout(value: Str)
+    // `grpc-status` was absent from the trailers, or was not a number
+    // in `0 ..= 16`.
+    GrpcBadStatus(value: Str)
+    // A message arrived after the trailers, or before the headers.
+    GrpcMessageOutOfOrder(at: Int)
+    // The trailers arrived with no headers before them — the
+    // "trailers-only" response, which is legal for a failure and not
+    // for anything else.  Carried as a refusal only when a message had
+    // already arrived.
+    GrpcTrailersWithoutHeaders
+    // The stream ended without trailers.  A call that ends this way
+    // has no status, which is the one thing every gRPC call is
+    // promised.
+    GrpcNoTrailers(at: Int)
+    // The peer reset the HTTP/2 stream.  The code is the host's, from
+    // its own framing layer; this package does not read HTTP/2 and
+    // carries the number so that `decode_status` can answer.
+    GrpcStreamReset(http2_code: Int)
+
+// message renders the refusal as one line of prose.
+//
+// `Result<_, GrpcDecodeError>` requires this impl: SPEC § 3.4 admits a
+// `Result` error type only if it implements `Error`.
+impl Error for GrpcDecodeError
+    // Answer the one-line report: what was wrong, and where when there
+    // is a where.
+    //
+    // ```novo
+    // use grpcerr
+    //
+    // fn main() [io]
+    //     let e = GrpcBadCompressedFlag(at: 0, flag: 2)
+    //     println(e.message())
+    //     // grpc: compressed flag 2 at byte 0 — the flag is 0 or 1
+    // ```
+    fn message(self) -> Str
+        todo("grpcerr.GrpcDecodeError.message")
+
+// The byte a decode refusal stopped at, or -1 for the variants that are
+// about a whole stream rather than a byte in it.
+//
+// -1 rather than 0, because byte 0 exists and a caller that printed it
+// would have been told something false.
+pub fn decode_offset(e: GrpcDecodeError) -> Int []
+    todo("grpcerr.decode_offset")
+
+// GrpcEncodeError is why something this package was asked to write
+// would not have been legal gRPC.
+pub enum GrpcEncodeError
+    // A message longer than the call's send limit.
+    GrpcMessageTooLarge(len: Int, limit: Int)
+    // The caller's buffer had `left` bytes and the frame needed `need`.
+    GrpcBufferTooSmall(need: Int, left: Int)
+    // A metadata name the caller may not set: anything beginning
+    // `grpc-`, which the protocol reserves, or `:`-prefixed, which is
+    // HTTP/2's own pseudo-header space.
+    GrpcReservedMetadataName(name: Str)
+    // A metadata name with a character the protocol does not allow.
+    GrpcInvalidMetadataName(name: Str)
+    // A `-bin` value handed over as text, or a text value handed over
+    // with bytes that are not printable ASCII.
+    GrpcMetadataValueNotAllowed(name: Str)
+    // A `grpc-timeout` whose value needs more than eight digits in
+    // every unit — the specification's own bound, and the reason the
+    // unit exists.
+    GrpcTimeoutTooLong(nanos: Int)
+    // A send on a call that is not open in that direction: a second
+    // request on a unary call, a message after `half_close`, a response
+    // before the headers.
+    GrpcWrongState(what: Str, state: Str)
+
+// message renders the refusal as one line of prose.
+impl Error for GrpcEncodeError
+    // Answer the one-line report.  There is no offset: nothing arrived,
+    // so there is nothing to point at.
+    fn message(self) -> Str
+        todo("grpcerr.GrpcEncodeError.message")

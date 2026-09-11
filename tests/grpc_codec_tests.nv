@@ -1,0 +1,782 @@
+// tests/grpc_codec_tests.nv — the protocol document's own worked
+// values, and the rules a wrong implementation gets wrong quietly.
+//
+// They COMPILE today and they FAIL at run, with `not implemented:
+// <module>.<fn>` from the `todo()` that is each body.  That is the
+// expected state of an interface release: the compiler has checked
+// every signature, every type and every effect row, and nothing else
+// has been checked because there is nothing else yet.
+//
+// WHERE THE VECTORS COME FROM.  gRPC's own `PROTOCOL-HTTP2.md` — the
+// request and response header sets, the `Timeout` grammar with its
+// `H M S m u n` units, the `Status-Code` list, the `Percent-Encoded`
+// message rule and the HTTP-status mapping table — and the status
+// definitions in `grpc/status.proto`.  The framed message below is
+// protobuf's own `08 96 01` with gRPC's five-byte prefix in front of
+// it, so a test that passes here is bytes any conforming
+// implementation reads the same way.
+
+use std.test
+use std.bytes
+use grpcframe
+use grpcstatus
+use grpcmeta
+use grpcsvc
+use grpccall
+use grpcerr
+use pbunknown
+
+// ── the five-byte prefix ────────────────────────────────────────────
+
+@test
+fn test_a_frame_is_one_flag_byte_and_four_big_endian_length_bytes()
+    // Big-endian, which is worth pinning: the protobuf message inside
+    // the frame is little-endian throughout, and a reader who has been
+    // staring at one of those will reach for the wrong helper.
+    test.assert_eq(grpcframe.header_len(), 5)
+    test.assert_eq(grpcframe.framed_len(3), 8)
+    test.assert_eq(grpcframe.max_encodable_len(), 4294967295)
+
+@test
+fn test_framing_a_message_puts_the_length_in_front_of_it()
+    // `08 96 01` is protobuf's own first worked example; the five bytes
+    // in front of it are gRPC's whole framing.
+    let body = bytes.from_hex("089601") ?? bytes.zeros(0)
+    match grpcframe.frame(body, false, grpcframe.default_limits())
+        Ok(out) => test.assert_eq(bytes.to_hex(out), "0000000003089601")
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_a_header_reads_back_the_flag_and_the_length()
+    let wire = bytes.from_hex("0000000003089601") ?? bytes.zeros(0)
+    match grpcframe.read_header_at(wire, 0)
+        Ok(h)  =>
+            test.assert_eq(h.flag, 0)
+            test.assert_eq(h.len, 3)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_compressed_flag_outside_zero_and_one_is_refused()
+    // The other 254 values are reserved and no implementation may
+    // guess at one.
+    let wire = bytes.from_hex("0200000003089601") ?? bytes.zeros(0)
+    match grpcframe.read_header_at(wire, 0)
+        Ok(_)  => test.fail("the flag is 0 or 1")
+        Err(e) =>
+            match e
+                GrpcBadCompressedFlag(_, flag) => test.assert_eq(flag, 2)
+                _                              => test.fail("expected GrpcBadCompressedFlag: ${e.message()}")
+
+@test
+fn test_the_default_limit_is_the_one_every_deployment_meets()
+    // 4 MiB, and the reason so many services fail at exactly
+    // 4,194,304 bytes.
+    test.assert_eq(grpcframe.default_limits().max_message, 4194304)
+    test.assert_eq(grpcframe.small_limits().max_message, 65536)
+
+@test
+fn test_a_length_past_the_limit_is_refused_before_anything_is_reserved()
+    // Four bytes can ask for four gigabytes, so the limit is checked
+    // against the announced length and not against what arrived.
+    let wire = bytes.from_hex("00ffffffff") ?? bytes.zeros(0)
+    let d = grpcframe.deframer(grpcframe.small_limits())
+    match grpcframe.feed(d, bytes.to_byte_list(wire))
+        Ok(_)  => test.fail("that length is past the limit")
+        Err(e) =>
+            match e
+                GrpcFrameTooLarge(_, _, limit) => test.assert_eq(limit, 65536)
+                _                              => test.fail("expected GrpcFrameTooLarge: ${e.message()}")
+
+@test
+fn test_the_deframer_drains_one_whole_message_and_says_it_wants_nothing()
+    let wire = bytes.from_hex("0000000003089601") ?? bytes.zeros(0)
+    let d = grpcframe.deframer(grpcframe.default_limits())
+    match grpcframe.feed(d, bytes.to_byte_list(wire))
+        Ok(s)  =>
+            test.assert_eq(s.messages.len(), 1)
+            test.assert_eq(s.need, 0)
+            test.assert_eq(s.messages[0].compressed, false)
+            test.assert_eq(bytes.to_hex(s.messages[0].body), "089601")
+            test.assert_eq(grpcframe.at_boundary(s.deframer), true)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_two_messages_in_one_chunk_both_come_out()
+    let wire = bytes.from_hex("00000000030896010000000003089701") ?? bytes.zeros(0)
+    match grpcframe.deframe_all(wire, grpcframe.default_limits())
+        Ok(ms) => test.assert_eq(ms.len(), 2)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_message_split_across_chunks_waits_and_says_how_much_it_wants()
+    // `need` is exact here rather than a hint: the header says how long
+    // the body is, so once a header has arrived the deframer knows
+    // precisely what it is waiting for.
+    let head = bytes.from_hex("000000000308") ?? bytes.zeros(0)
+    let tail = bytes.from_hex("9601") ?? bytes.zeros(0)
+    let d = grpcframe.deframer(grpcframe.default_limits())
+    match grpcframe.feed(d, bytes.to_byte_list(head))
+        Ok(s1) =>
+            test.assert_eq(s1.messages.len(), 0)
+            test.assert_eq(s1.need, 2)
+            match grpcframe.feed(s1.deframer, bytes.to_byte_list(tail))
+                Ok(s2) => test.assert_eq(s2.messages.len(), 1)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_stream_that_ends_mid_message_is_a_fault_and_not_an_end()
+    let head = bytes.from_hex("000000000308") ?? bytes.zeros(0)
+    let d = grpcframe.deframer(grpcframe.default_limits())
+    match grpcframe.feed(d, bytes.to_byte_list(head))
+        Ok(s1) =>
+            match grpcframe.finish(s1.deframer)
+                Ok(_)  => test.fail("two bytes are still missing")
+                Err(e) =>
+                    match e
+                        GrpcFrameTruncated(_, need) => test.assert_eq(need, 2)
+                        _                           => test.fail("expected GrpcFrameTruncated: ${e.message()}")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_stream_that_ends_on_a_boundary_ends_cleanly()
+    let d = grpcframe.deframer(grpcframe.default_limits())
+    match grpcframe.finish(d)
+        Ok(s)  => test.assert_eq(s.messages.len(), 0)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_writing_a_header_takes_the_callers_buffer()
+    var c = bytes.cursor_be(bytes.zeros(5))
+    match grpcframe.write_header_into(false, 3, c)
+        Ok(n)  => test.assert_eq(n, 5)
+        Err(e) => test.fail(e.message())
+    var small = bytes.cursor_be(bytes.zeros(2))
+    match grpcframe.write_header_into(false, 3, small)
+        Ok(_)  => test.fail("five bytes do not fit in two")
+        Err(e) =>
+            match e
+                GrpcBufferTooSmall(need, left) =>
+                    test.assert_eq(need, 5)
+                    test.assert_eq(left, 2)
+                _                              => test.fail("expected GrpcBufferTooSmall: ${e.message()}")
+
+@test
+fn test_the_deframer_reports_where_it_is()
+    let d = grpcframe.deframer(grpcframe.default_limits())
+    test.assert_eq(grpcframe.offset(d), 0)
+    test.assert_eq(grpcframe.pending_len(d), 0)
+
+// ── the seventeen status codes ──────────────────────────────────────
+
+@test
+fn test_the_status_numbers_are_the_wires_own()
+    test.assert_eq(grpcstatus.status_code(GrpcOk), 0)
+    test.assert_eq(grpcstatus.status_code(GrpcCancelled), 1)
+    test.assert_eq(grpcstatus.status_code(GrpcInvalidArgument), 3)
+    test.assert_eq(grpcstatus.status_code(GrpcNotFound), 5)
+    test.assert_eq(grpcstatus.status_code(GrpcPermissionDenied), 7)
+    test.assert_eq(grpcstatus.status_code(GrpcUnimplemented), 12)
+    test.assert_eq(grpcstatus.status_code(GrpcUnavailable), 14)
+    test.assert_eq(grpcstatus.status_code(GrpcUnauthenticated), 16)
+
+@test
+fn test_a_status_number_reads_back_and_anything_past_sixteen_does_not()
+    // `None` rather than `UNKNOWN`: a code this package cannot read is
+    // a peer speaking a later version, and folding it onto 2 would hide
+    // that.
+    match grpcstatus.status_of_code(5)
+        Some(s) => test.assert_eq(grpcstatus.status_name(s), "NOT_FOUND")
+        None    => test.fail("5 is NOT_FOUND")
+    match grpcstatus.status_of_code(17)
+        Some(_) => test.fail("there are seventeen codes, 0 through 16")
+        None    => test.assert_eq(1, 1)
+
+@test
+fn test_the_names_are_the_ones_every_other_implementation_logs()
+    test.assert_eq(grpcstatus.status_name(GrpcOk), "OK")
+    test.assert_eq(grpcstatus.status_name(GrpcDeadlineExceeded), "DEADLINE_EXCEEDED")
+    test.assert_eq(grpcstatus.status_name(GrpcFailedPrecondition), "FAILED_PRECONDITION")
+    test.assert_eq(grpcstatus.status_name(GrpcResourceExhausted), "RESOURCE_EXHAUSTED")
+    match grpcstatus.status_of_name("UNAVAILABLE")
+        Some(s) => test.assert_eq(grpcstatus.status_code(s), 14)
+        None    => test.fail("UNAVAILABLE is a status")
+
+@test
+fn test_only_unavailable_is_safe_for_a_generic_client_to_retry()
+    // DEADLINE_EXCEEDED is deliberately false: the deadline may have
+    // passed after the work succeeded, so a retry can do it twice.
+    test.assert_eq(grpcstatus.is_retryable(GrpcUnavailable), true)
+    test.assert_eq(grpcstatus.is_retryable(GrpcDeadlineExceeded), false)
+    test.assert_eq(grpcstatus.is_retryable(GrpcAborted), false)
+    test.assert_eq(grpcstatus.is_retryable(GrpcInternal), false)
+
+@test
+fn test_the_http_status_mapping_is_the_specifications_own_table()
+    // It exists because a proxy between the two ends can answer HTTP
+    // without ever having spoken gRPC.
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_http(400)), "INTERNAL")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_http(401)), "UNAUTHENTICATED")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_http(403)), "PERMISSION_DENIED")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_http(404)), "UNIMPLEMENTED")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_http(429)), "UNAVAILABLE")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_http(502)), "UNAVAILABLE")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_http(503)), "UNAVAILABLE")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_http(504)), "UNAVAILABLE")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_http(418)), "UNKNOWN")
+
+@test
+fn test_a_stream_reset_maps_to_a_status_because_a_reset_call_has_no_trailers()
+    // 8 is CANCEL, 7 is REFUSED_STREAM, 11 is ENHANCE_YOUR_CALM.
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_stream_reset(8)), "CANCELLED")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_stream_reset(7)), "UNAVAILABLE")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_stream_reset(11)), "RESOURCE_EXHAUSTED")
+    test.assert_eq(grpcstatus.status_name(grpcstatus.status_of_stream_reset(2)), "INTERNAL")
+
+@test
+fn test_a_decode_refusal_answers_the_status_to_close_the_stream_with()
+    // The whole point of the function: an endpoint that finds a
+    // malformed frame should not have to choose between seventeen codes
+    // with a specification open beside it.
+    test.assert_eq(
+        grpcstatus.status_name(grpcstatus.status_of_decode_error(
+            GrpcFrameTooLarge(at: 0, len: 99, limit: 10))),
+            "RESOURCE_EXHAUSTED")
+    test.assert_eq(
+        grpcstatus.status_name(grpcstatus.status_of_decode_error(
+            GrpcNoTrailers(at: 8))),
+            "UNKNOWN")
+
+// ── the trailers ────────────────────────────────────────────────────
+
+@test
+fn test_the_trailers_carry_the_status_and_the_message()
+    let t = grpcstatus.trailers(GrpcNotFound, "no such order")
+    test.assert_eq(grpcstatus.status_code(t.status), 5)
+    test.assert_eq(t.message, "no such order")
+    test.assert_eq(grpcstatus.is_ok(t), false)
+    test.assert_eq(grpcstatus.is_ok(grpcstatus.ok_trailers()), true)
+
+@test
+fn test_the_message_is_percent_encoded_which_almost_nobody_expects()
+    // `grpc-message` travels in an HTTP/2 header, so it may hold only
+    // printable ASCII.  A client that printed the raw header would show
+    // `caf%C3%A9` for a message a server wrote as `café`.
+    test.assert_eq(grpcstatus.encode_message("café"), "caf%C3%A9")
+    test.assert_eq(grpcstatus.encode_message("100%"), "100%25")
+    test.assert_eq(grpcstatus.decode_message("caf%C3%A9"), "café")
+
+@test
+fn test_decoding_a_message_is_lenient_because_it_is_diagnostic_text()
+    // A `%` that is not followed by two hex digits is kept as a
+    // literal, because refusing to read one would turn a server's bad
+    // error string into a client's transport failure.
+    test.assert_eq(grpcstatus.decode_message("100% done"), "100% done")
+
+@test
+fn test_the_header_names_are_spelled_once()
+    // A typo in a header name is a call that never ends rather than a
+    // call that fails.
+    test.assert_eq(grpcstatus.status_header(), "grpc-status")
+    test.assert_eq(grpcstatus.message_header(), "grpc-message")
+    test.assert_eq(grpcstatus.details_header(), "grpc-status-details-bin")
+
+// ── metadata ────────────────────────────────────────────────────────
+
+@test
+fn test_a_metadata_name_is_lower_case_or_it_is_nothing()
+    // HTTP/2 header names are lower case, and a name with a capital in
+    // it is a name the far end will not find.
+    test.assert_eq(grpcmeta.is_valid_name("x-trace-id"), true)
+    test.assert_eq(grpcmeta.is_valid_name("X-Trace-Id"), false)
+    test.assert_eq(grpcmeta.is_valid_name(""), false)
+    test.assert_eq(grpcmeta.is_valid_name("x_trace.id-1"), true)
+
+@test
+fn test_the_grpc_prefix_and_the_colon_space_belong_to_the_protocol()
+    test.assert_eq(grpcmeta.is_reserved_name("grpc-timeout"), true)
+    test.assert_eq(grpcmeta.is_reserved_name(":path"), true)
+    test.assert_eq(grpcmeta.is_reserved_name("x-trace-id"), false)
+
+@test
+fn test_an_application_cannot_set_a_reserved_name()
+    match grpcmeta.set(grpcmeta.empty(), "grpc-timeout", "1S")
+        Ok(_)  => test.fail("grpc- belongs to the protocol")
+        Err(e) =>
+            match e
+                GrpcReservedMetadataName(name) => test.assert_eq(name, "grpc-timeout")
+                _                              => test.fail("expected GrpcReservedMetadataName: ${e.message()}")
+
+@test
+fn test_the_bin_suffix_is_the_whole_of_how_bytes_travel_in_a_header()
+    test.assert_eq(grpcmeta.is_binary_name("trace-context-bin"), true)
+    test.assert_eq(grpcmeta.is_binary_name("trace-context"), false)
+    test.assert_eq(grpcmeta.is_valid_text_value("ok"), true)
+    test.assert_eq(grpcmeta.is_valid_text_value("caf\u{e9}"), false)
+
+@test
+fn test_metadata_keeps_the_order_repeated_names_arrived_in()
+    match grpcmeta.append(grpcmeta.empty(), "x-tag", "a")
+        Ok(one) =>
+            match grpcmeta.append(one, "x-tag", "b")
+                Ok(two) =>
+                    test.assert_eq(grpcmeta.count(two), 2)
+                    test.assert_eq(grpcmeta.get_all(two, "x-tag").len(), 2)
+                    test.assert_eq(grpcmeta.get_all(two, "x-tag")[0], "a")
+                    test.assert_eq(grpcmeta.has(two, "x-tag"), true)
+                    test.assert_eq(grpcmeta.count(grpcmeta.remove(two, "x-tag")), 0)
+                Err(e)  => test.fail(e.message())
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_get_answers_the_first_value_and_none_for_a_name_nobody_set()
+    match grpcmeta.get(grpcmeta.empty(), "x-tag")
+        Some(_) => test.fail("nothing was set")
+        None    => test.assert_eq(1, 1)
+    test.assert_eq(grpcmeta.entries_of(grpcmeta.empty()).len(), 0)
+    test.assert_eq(grpcmeta.metadata([]).entries.len(), 0)
+
+// ── the content type ────────────────────────────────────────────────
+
+@test
+fn test_the_content_type_names_the_protocol_and_its_subtype_the_payload()
+    test.assert_eq(grpcmeta.content_type(), "application/grpc")
+    test.assert_eq(grpcmeta.content_type_for("proto"), "application/grpc+proto")
+    test.assert_eq(grpcmeta.is_grpc_content_type("application/grpc"), true)
+    test.assert_eq(grpcmeta.is_grpc_content_type("application/grpc+json"), true)
+    test.assert_eq(grpcmeta.is_grpc_content_type("application/grpc; charset=utf-8"), true)
+    test.assert_eq(grpcmeta.is_grpc_content_type("application/json"), false)
+
+@test
+fn test_a_bare_content_type_means_protobuf_because_the_specification_says_so()
+    test.assert_eq(grpcmeta.message_subtype("application/grpc"), "proto")
+    test.assert_eq(grpcmeta.message_subtype("application/grpc+json"), "json")
+    test.assert_eq(grpcmeta.encoding_header(), "grpc-encoding")
+    test.assert_eq(grpcmeta.accept_encoding_header(), "grpc-accept-encoding")
+
+// ── the deadline ────────────────────────────────────────────────────
+
+@test
+fn test_the_timeout_units_are_six_and_two_of_them_differ_only_in_case()
+    // `M` is minutes and `m` is milliseconds, and getting the two the
+    // wrong way round is a call that times out sixty thousand times too
+    // late.
+    test.assert_eq(grpcmeta.unit_char(GrpcHours), "H")
+    test.assert_eq(grpcmeta.unit_char(GrpcMinutes), "M")
+    test.assert_eq(grpcmeta.unit_char(GrpcSeconds), "S")
+    test.assert_eq(grpcmeta.unit_char(GrpcMilliseconds), "m")
+    test.assert_eq(grpcmeta.unit_char(GrpcMicroseconds), "u")
+    test.assert_eq(grpcmeta.unit_char(GrpcNanoseconds), "n")
+    test.assert_eq(grpcmeta.unit_nanos(GrpcMilliseconds), 1000000)
+    test.assert_eq(grpcmeta.unit_nanos(GrpcMinutes), 60000000000)
+
+@test
+fn test_a_unit_character_reads_back_and_anything_else_does_not()
+    match grpcmeta.unit_of_char("m")
+        Some(u) => test.assert_eq(grpcmeta.unit_nanos(u), 1000000)
+        None    => test.fail("m is milliseconds")
+    match grpcmeta.unit_of_char("d")
+        Some(_) => test.fail("there is no day unit")
+        None    => test.assert_eq(1, 1)
+
+@test
+fn test_a_deadline_is_digits_then_a_unit()
+    test.assert_eq(grpcmeta.deadline_text(GrpcDeadline { value: 100, unit: GrpcMilliseconds }), "100m")
+    test.assert_eq(grpcmeta.deadline_text(GrpcDeadline { value: 1, unit: GrpcHours }), "1H")
+    test.assert_eq(grpcmeta.max_timeout_digits(), 8)
+    test.assert_eq(grpcmeta.timeout_header(), "grpc-timeout")
+
+@test
+fn test_a_deadline_reads_back_and_a_malformed_one_is_refused()
+    match grpcmeta.deadline_of_text("100m")
+        Ok(d)  => test.assert_eq(grpcmeta.deadline_nanos(d), 100000000)
+        Err(e) => test.fail(e.message())
+    match grpcmeta.deadline_of_text("100x")
+        Ok(_)  => test.fail("x is not a unit")
+        Err(e) =>
+            match e
+                GrpcBadTimeout(value) => test.assert_eq(value, "100x")
+                _                     => test.fail("expected GrpcBadTimeout: ${e.message()}")
+    match grpcmeta.deadline_of_text("123456789S")
+        Ok(_)  => test.fail("nine digits is past the bound")
+        Err(e) =>
+            match e
+                GrpcBadTimeout(_) => test.assert_eq(1, 1)
+                _                 => test.fail("expected GrpcBadTimeout: ${e.message()}")
+
+@test
+fn test_the_unit_is_chosen_so_that_nothing_is_rounded()
+    // Rounding a deadline down cancels work that would have finished,
+    // and rounding it up outlives the caller.
+    match grpcmeta.deadline_of_nanos(1500000)
+        Ok(d)  => test.assert_eq(grpcmeta.deadline_text(d), "1500u")
+        Err(e) => test.fail(e.message())
+    match grpcmeta.deadline_of_nanos(1000000)
+        Ok(d)  => test.assert_eq(grpcmeta.deadline_text(d), "1m")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_proxy_must_decrement_the_deadline_as_it_forwards()
+    // The header is a duration from receipt, so forwarding one
+    // unchanged gives the next hop the whole budget again and a chain
+    // of five proxies multiplies the deadline by five.  The elapsed
+    // time is a parameter because a `core` package has no clock.
+    let d = GrpcDeadline { value: 100, unit: GrpcMilliseconds }
+    test.assert_eq(grpcmeta.remaining(d, 40000000), 60000000)
+    test.assert_eq(grpcmeta.remaining(d, 200000000), 0)
+
+// ── service descriptors ─────────────────────────────────────────────
+
+@test
+fn test_a_method_is_a_path_and_the_leading_dot_is_not_in_it()
+    // A server that compared the descriptor's spelling against the
+    // path's would route nothing.
+    test.assert_eq(grpcsvc.path_of(".acme.Orders", "Get"), "/acme.Orders/Get")
+    test.assert_eq(grpcsvc.full_name_of_path_service("acme.Orders"), ".acme.Orders")
+
+@test
+fn test_a_path_reads_back_into_its_two_halves()
+    match grpcsvc.parse_path("/acme.Orders/Get")
+        Some(p) =>
+            test.assert_eq(p.service, "acme.Orders")
+            test.assert_eq(p.method, "Get")
+        None    => test.fail("that is a gRPC path")
+
+@test
+fn test_a_string_that_is_not_two_segments_is_not_a_path()
+    match grpcsvc.parse_path("/acme.Orders")
+        Some(_) => test.fail("a path has two segments")
+        None    => test.assert_eq(1, 1)
+    match grpcsvc.parse_path("acme.Orders/Get")
+        Some(_) => test.fail("a path begins with a slash")
+        None    => test.assert_eq(1, 1)
+    match grpcsvc.parse_path("/acme.Orders/")
+        Some(_) => test.fail("the method half may not be empty")
+        None    => test.assert_eq(1, 1)
+
+fn a_unary_method() -> GrpcMethodDesc
+    GrpcMethodDesc { service: ".acme.Orders", name: "Get",
+        path: "/acme.Orders/Get", input_type: ".acme.GetReq",
+        output_type: ".acme.Order", streaming: PbUnary }
+
+fn a_server_stream_method() -> GrpcMethodDesc
+    GrpcMethodDesc { service: ".acme.Orders", name: "Watch",
+        path: "/acme.Orders/Watch", input_type: ".acme.WatchReq",
+        output_type: ".acme.Order", streaming: PbServerStream }
+
+@test
+fn test_the_four_streaming_shapes_are_two_booleans_with_names_on()
+    test.assert_eq(grpcsvc.client_streams(a_unary_method()), false)
+    test.assert_eq(grpcsvc.server_streams(a_unary_method()), false)
+    test.assert_eq(grpcsvc.client_streams(a_server_stream_method()), false)
+    test.assert_eq(grpcsvc.server_streams(a_server_stream_method()), true)
+
+@test
+fn test_a_streaming_direction_has_no_message_count_that_a_peer_can_reach()
+    // -1 rather than a large number, so that a state machine comparing
+    // against it cannot be made to pass by a peer sending enough.
+    test.assert_eq(grpcsvc.request_count(a_unary_method()), 1)
+    test.assert_eq(grpcsvc.response_count(a_unary_method()), 1)
+    test.assert_eq(grpcsvc.response_count(a_server_stream_method()), 0 - 1)
+
+@test
+fn test_an_empty_descriptor_set_declares_no_services()
+    let set = PbFileSet { files: [] }
+    test.assert_eq(grpcsvc.services_of(set).len(), 0)
+    match grpcsvc.service_of(set, ".acme.Orders")
+        Some(_) => test.fail("the set is empty")
+        None    => test.assert_eq(1, 1)
+    match grpcsvc.method_of_path(set, "/acme.Orders/Get")
+        Some(_) => test.fail("the set is empty")
+        None    => test.assert_eq(1, 1)
+
+@test
+fn test_the_two_services_every_deployment_has_are_named()
+    test.assert_eq(grpcsvc.reflection_service_name(), ".grpc.reflection.v1.ServerReflection")
+    test.assert_eq(grpcsvc.reflection_method_path(),
+        "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo")
+    test.assert_eq(grpcsvc.health_service_name(), ".grpc.health.v1.Health")
+
+@test
+fn test_a_service_descriptor_can_be_searched_by_method_name()
+    let svc = GrpcServiceDesc { full_name: ".acme.Orders",
+        methods: [a_unary_method()] }
+    match grpcsvc.method_of(svc, "Get")
+        Some(m) => test.assert_eq(m.path, "/acme.Orders/Get")
+        None    => test.fail("Orders declares Get")
+
+// ── the call ────────────────────────────────────────────────────────
+
+@test
+fn test_a_fresh_call_is_idle_in_both_directions()
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    test.assert_eq(grpccall.state_name(grpccall.state_of(c)), "IDLE")
+    test.assert_eq(grpccall.half_closed_local(c), false)
+    test.assert_eq(grpccall.half_closed_remote(c), false)
+    test.assert_eq(grpccall.sent_count(c), 0)
+    test.assert_eq(grpccall.received_count(c), 0)
+    match grpccall.trailers_of(c)
+        Some(_) => test.fail("nothing has ended")
+        None    => test.assert_eq(1, 1)
+
+@test
+fn test_starting_a_request_answers_the_headers_the_host_must_send()
+    // The action list is this package's whole output: nothing here
+    // writes a byte anywhere, and the host does exactly these things.
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    match grpccall.start_request(c, "acme.example", "https", grpcmeta.empty(), None)
+        Ok(s)  =>
+            test.assert_eq(s.actions.len(), 1)
+            match s.actions[0]
+                GrpcSendHeaders(md) =>
+                    // `te: trailers` is not decoration: it is how a
+                    // client says it will read trailers, and a server
+                    // may refuse a request without it.
+                    match grpcmeta.get(md, "te")
+                        Some(v) => test.assert_eq(v, "trailers")
+                        None    => test.fail("te: trailers is required")
+                    match grpcmeta.get(md, ":path")
+                        Some(v) => test.assert_eq(v, "/acme.Orders/Get")
+                        None    => test.fail(":path carries the method")
+                _                   => test.fail("expected GrpcSendHeaders")
+            test.assert_eq(grpccall.state_name(grpccall.state_of(s.call)), "HEADERS_SENT")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_request_carries_its_deadline_when_it_has_one()
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    let d = GrpcDeadline { value: 100, unit: GrpcMilliseconds }
+    match grpccall.request_headers(c, "acme.example", "https", grpcmeta.empty(), Some(d))
+        Ok(md) =>
+            match grpcmeta.get(md, "grpc-timeout")
+                Some(v) => test.assert_eq(v, "100m")
+                None    => test.fail("the deadline travels as a header")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_second_request_on_a_unary_call_is_the_callers_own_mistake()
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    match grpccall.start_request(c, "acme.example", "https", grpcmeta.empty(), None)
+        Ok(s1) =>
+            match grpccall.start_request(s1.call, "acme.example", "https", grpcmeta.empty(), None)
+                Ok(_)  => test.fail("the call has already started")
+                Err(e) =>
+                    match e
+                        GrpcWrongState(_, _) => test.assert_eq(1, 1)
+                        _                    => test.fail("expected GrpcWrongState: ${e.message()}")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_sending_a_message_answers_framed_data_and_nothing_else()
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    let body = bytes.from_hex("089601") ?? bytes.zeros(0)
+    match grpccall.start_request(c, "acme.example", "https", grpcmeta.empty(), None)
+        Ok(s1) =>
+            match grpccall.send_message(s1.call, body, false)
+                Ok(s2) =>
+                    test.assert_eq(grpccall.sent_count(s2.call), 1)
+                    match s2.actions[0]
+                        GrpcSendData(data, end_stream) =>
+                            test.assert_eq(bytes.to_hex(data), "0000000003089601")
+                            test.assert_eq(end_stream, false)
+                        _                              => test.fail("expected GrpcSendData")
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_message_past_the_send_limit_never_reaches_the_host()
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.small_limits())
+    match grpccall.start_request(c, "acme.example", "https", grpcmeta.empty(), None)
+        Ok(s1) =>
+            match grpccall.send_message(s1.call, bytes.zeros(70000), false)
+                Ok(_)  => test.fail("70000 bytes is past a 64 KiB limit")
+                Err(e) =>
+                    match e
+                        GrpcMessageTooLarge(_, limit) => test.assert_eq(limit, 65536)
+                        _                             => test.fail("expected GrpcMessageTooLarge: ${e.message()}")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_client_half_closes_and_goes_on_receiving()
+    // The two directions are independent, which is what makes the long
+    // poll representable.
+    let c = grpccall.call(GrpcClientSide, a_server_stream_method(), grpcframe.default_limits())
+    match grpccall.start_request(c, "acme.example", "https", grpcmeta.empty(), None)
+        Ok(s1) =>
+            match grpccall.half_close(s1.call)
+                Ok(s2) =>
+                    test.assert_eq(grpccall.half_closed_local(s2.call), true)
+                    test.assert_eq(grpccall.half_closed_remote(s2.call), false)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_client_cancels_by_resetting_the_stream()
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    let s = grpccall.cancel(c)
+    match s.actions[0]
+        GrpcSendReset(code) => test.assert_eq(code, 8)
+        _                   => test.fail("expected GrpcSendReset")
+    test.assert_eq(grpccall.state_name(grpccall.state_of(s.call)), "ABORTED")
+
+@test
+fn test_a_trailers_only_response_is_told_apart_by_the_status_header()
+    // The one ambiguity in the protocol a reader has to be told about:
+    // a client that assumed a HEADERS frame is the response head will
+    // wait forever for a body that is never coming.
+    match grpcmeta.append(grpcmeta.empty(), "grpc-status", "12")
+        Ok(md) => test.assert_eq(grpccall.is_trailers_only(md), true)
+        Err(e) => test.fail(e.message())
+    test.assert_eq(grpccall.is_trailers_only(grpcmeta.empty()), false)
+
+@test
+fn test_trailers_without_a_status_are_a_fault_and_not_an_answer()
+    // A call with no status is the one thing gRPC promises cannot
+    // happen.
+    match grpccall.trailers_of_headers(grpcmeta.empty())
+        Ok(_)  => test.fail("a trailer set carries grpc-status")
+        Err(e) =>
+            match e
+                GrpcBadStatus(_) => test.assert_eq(1, 1)
+                _                => test.fail("expected GrpcBadStatus: ${e.message()}")
+
+@test
+fn test_a_trailer_set_round_trips_through_its_headers()
+    let t = grpcstatus.trailers(GrpcNotFound, "café")
+    match grpccall.trailer_headers(t, grpcmeta.empty())
+        Ok(md) =>
+            // Encoded on the way out …
+            match grpcmeta.get(md, "grpc-message")
+                Some(v) => test.assert_eq(v, "caf%C3%A9")
+                None    => test.fail("the message travels as a header")
+            // … and decoded on the way back, so a caller never meets
+            // the encoded form.
+            match grpccall.trailers_of_headers(md)
+                Ok(back) => test.assert_eq(back.message, "café")
+                Err(e)   => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_reset_call_still_answers_a_status()
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    let s = grpccall.on_reset(c, 7)
+    match s.events[0]
+        GrpcCallDone(t) => test.assert_eq(grpcstatus.status_name(t.status), "UNAVAILABLE")
+        _               => test.fail("expected GrpcCallDone")
+
+@test
+fn test_a_lost_connection_is_unavailable_because_that_is_what_a_client_may_retry()
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    let s = grpccall.on_connection_lost(c)
+    match s.events[0]
+        GrpcCallDone(t) => test.assert_eq(grpcstatus.status_name(t.status), "UNAVAILABLE")
+        _               => test.fail("expected GrpcCallDone")
+
+@test
+fn test_a_server_answers_headers_before_it_knows_whether_it_will_succeed()
+    // Which is exactly why the status is in the trailers.
+    let c = grpccall.call(GrpcServerSide, a_unary_method(), grpcframe.default_limits())
+    match grpccall.response_headers(c, grpcmeta.empty())
+        Ok(md) =>
+            match grpcmeta.get(md, "content-type")
+                Some(v) => test.assert_eq(v, "application/grpc+proto")
+                None    => test.fail("a response names the content type")
+        Err(e) => test.fail(e.message())
+    match grpccall.start_response(c, grpcmeta.empty())
+        Ok(s)  => test.assert_eq(s.actions.len(), 1)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_server_can_end_a_call_with_no_messages_at_all()
+    // The trailers-only response: one HEADERS frame with end_stream
+    // set, which is what a server answers for an unroutable path.
+    let c = grpccall.call(GrpcServerSide, a_unary_method(), grpcframe.default_limits())
+    match grpccall.trailers_only(c, grpcstatus.trailers(GrpcUnimplemented, ""), grpcmeta.empty())
+        Ok(s)  =>
+            match s.actions[0]
+                GrpcSendTrailers(_) => test.assert_eq(1, 1)
+                _                   => test.fail("expected GrpcSendTrailers")
+            test.assert_eq(grpccall.state_name(grpccall.state_of(s.call)), "CLOSED")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_server_ends_an_open_call_with_its_trailers()
+    let c = grpccall.call(GrpcServerSide, a_unary_method(), grpcframe.default_limits())
+    match grpccall.start_response(c, grpcmeta.empty())
+        Ok(s1) =>
+            match grpccall.finish_response(s1.call, grpcstatus.ok_trailers(), grpcmeta.empty())
+                Ok(s2) => test.assert_eq(grpccall.state_name(grpccall.state_of(s2.call)), "CLOSED")
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_arriving_headers_and_data_become_events()
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    match grpcmeta.append(grpcmeta.empty(), "content-type", "application/grpc+proto")
+        Ok(md) =>
+            match grpccall.on_headers(c, md)
+                Ok(s1) =>
+                    match s1.events[0]
+                        GrpcHeadersIn(_) => test.assert_eq(1, 1)
+                        _                => test.fail("expected GrpcHeadersIn")
+                    let wire = bytes.from_hex("0000000003089601") ?? bytes.zeros(0)
+                    match grpccall.on_data(s1.call, bytes.to_byte_list(wire), false)
+                        Ok(s2) =>
+                            test.assert_eq(grpccall.received_count(s2.call), 1)
+                            match s2.events[0]
+                                GrpcMessageIn(m) => test.assert_eq(bytes.to_hex(m.body), "089601")
+                                _                => test.fail("expected GrpcMessageIn")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_arriving_trailers_end_the_call()
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    match grpcmeta.append(grpcmeta.empty(), "grpc-status", "0")
+        Ok(md) =>
+            match grpccall.on_trailers(c, md)
+                Ok(s)  =>
+                    test.assert_eq(grpccall.state_name(grpccall.state_of(s.call)), "CLOSED")
+                    match grpccall.trailers_of(s.call)
+                        Some(t) => test.assert_eq(grpcstatus.is_ok(t), true)
+                        None    => test.fail("the call has trailers now")
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_content_type_a_proxy_rewrote_is_its_own_refusal()
+    // Which is what a proxy that stripped the header looks like from
+    // here, and the reason the specification gives it a code of its
+    // own.
+    let c = grpccall.call(GrpcClientSide, a_unary_method(), grpcframe.default_limits())
+    match grpcmeta.append(grpcmeta.empty(), "content-type", "text/html")
+        Ok(md) =>
+            match grpccall.on_headers(c, md)
+                Ok(_)  => test.fail("text/html is not gRPC")
+                Err(e) =>
+                    match e
+                        GrpcBadContentType(v) => test.assert_eq(v, "text/html")
+                        _                     => test.fail("expected GrpcBadContentType: ${e.message()}")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_refusal_says_where_when_there_is_a_where_and_minus_one_when_there_is_not()
+    // -1 rather than 0, because byte 0 exists and a caller that printed
+    // it would have been told something false.
+    test.assert_eq(grpcerr.decode_offset(GrpcFrameTruncated(at: 6, need: 2)), 6)
+    test.assert_eq(grpcerr.decode_offset(GrpcBadContentType(value: "text/html")), 0 - 1)
+
+@test
+fn test_a_protobuf_method_crosses_into_a_grpc_one_with_its_path_filled_in()
+    // The bridge for a caller that already walked the descriptor
+    // itself: protobuf-nv knows the names and the streaming flags, and
+    // this package adds the `:path`.
+    let svc = PbService { name: "Orders", full_name: ".acme.Orders",
+        methods: [], deprecated: false, unknown: pbunknown.empty() }
+    let m = PbMethod { name: "Get", input_type: ".acme.GetReq",
+        output_type: ".acme.Order", streaming: PbUnary,
+        deprecated: false, unknown: pbunknown.empty() }
+    let d = grpcsvc.method_desc(svc, m)
+    test.assert_eq(d.path, "/acme.Orders/Get")
+    test.assert_eq(d.service, ".acme.Orders")

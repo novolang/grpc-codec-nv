@@ -1,0 +1,355 @@
+// grpccall — one call, as a state machine that owns no socket.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE LOAD-BEARING INTERFACE OF THE PACKAGE IS `GrpcAction`.  Every
+// function here answers a `GrpcCallStep`, which holds the call after
+// the step, the EVENTS the caller has learned, and the ACTIONS the
+// host must perform on the HTTP/2 stream it owns.  Nothing in this
+// package writes a byte anywhere; the host does, and the action list is
+// the whole of what it is told to do.  That is `docs/publishing.md`
+// § How a `core` package takes bytes from its host, applied to a
+// protocol rather than to a format: the core is a state machine, the
+// host is the only party that performs anything.
+//
+// WHAT THE HOST MUST PROVIDE.  An HTTP/2 stream, and specifically:
+// opening one, sending and receiving HEADERS and DATA and TRAILERS,
+// per-stream flow control, and RST_STREAM in both directions.  This
+// package hands over header NAME-VALUE PAIRS and DATA BYTES and takes
+// the same back; HPACK, frame headers, window updates and settings
+// never appear in this API.  The README's "where HTTP/2 belongs" says
+// which package that is and why it is not this one.
+//
+// WHY NOT http-codec-nv.  HTTP/1.1 cannot carry gRPC: the protocol
+// requires trailers on every response, two independent streams in one
+// call, and per-stream flow control, and 1.1 has none of the three.
+// The absence of that dependency is a statement rather than an
+// oversight.
+//
+// THE TWO DIRECTIONS ARE INDEPENDENT.  A bidirectional call has a
+// deframer per direction and a half-close per direction, and a client
+// that has said everything it has to say can go on receiving for
+// minutes.  Folding them into one state would make the common
+// long-poll shape unrepresentable.
+
+use grpcframe
+use grpcmeta
+use grpcstatus
+
+// Which end of the call this is.
+//
+// The state machine is nearly symmetric and not quite: only a client
+// sends `:path` and a deadline, only a server sends `grpc-status`, and
+// a trailers-only response is legal in one direction and not the other.
+pub enum GrpcRole
+    // The end that opens the stream and sends the request headers.
+    GrpcClientSide
+    // The end that answers, and that ends the call by sending the
+    // trailers.
+    GrpcServerSide
+
+// Where the call has got to.
+//
+// One value for the whole call rather than one per direction, because
+// the interesting transitions are the ones both directions agree on.
+// `half_closed_local` and `half_closed_remote` are the two accessors
+// that answer the per-direction question.
+pub enum GrpcCallState
+    // Nothing has been sent or received.
+    GrpcIdle
+    // The request headers have gone; the response headers have not
+    // arrived.
+    GrpcHeadersSent
+    // Both header sets have crossed and messages may flow both ways.
+    GrpcOpen
+    // This end has said everything it has to say and is still
+    // receiving.
+    GrpcHalfClosedLocal
+    // The far end has said everything and this end may still send.
+    GrpcHalfClosedRemote
+    // The trailers have crossed; the call has a status.
+    GrpcClosed
+    // The stream was reset, or a refusal ended the call.  Distinct from
+    // `GrpcClosed` because a reset call has no trailers and therefore
+    // no status of its own — `grpcstatus.status_of_stream_reset` is
+    // where one comes from.
+    GrpcAborted
+
+// What the caller has learned.
+pub enum GrpcCallEvent
+    // The peer's headers arrived, content type and metadata checked.
+    GrpcHeadersIn(md: GrpcMetadata)
+    // A whole message arrived, deframed.  Still compressed when the
+    // frame said so; the host inflates it with whatever
+    // `grpc-encoding` named.
+    GrpcMessageIn(msg: GrpcMessage)
+    // The peer's trailers arrived: the call has a status.
+    GrpcTrailersIn(t: GrpcTrailers)
+    // The peer will send no more messages in its direction.
+    GrpcHalfClosedIn
+    // The call is over, with this status.  Always the last event.
+    GrpcCallDone(t: GrpcTrailers)
+
+// What the host must do on the stream it owns.
+//
+// This is the package's whole output.  The host walks the list in
+// order and does exactly these things; nothing else about the call
+// reaches the network.
+pub enum GrpcAction
+    // Send a HEADERS frame with these name-value pairs.  `end_stream`
+    // is false: a gRPC request with no body is still a request with a
+    // body of zero messages.
+    GrpcSendHeaders(md: GrpcMetadata)
+    // Send these bytes as DATA.  They are already framed — the
+    // five-byte prefix is in them — so the host writes them and does
+    // not look inside.
+    GrpcSendData(data: Bytes, end_stream: Bool)
+    // Send a TRAILERS frame, which is a HEADERS frame with
+    // `end_stream` set.  Servers only.
+    GrpcSendTrailers(md: GrpcMetadata)
+    // End this direction with no trailers: a client that has finished
+    // sending.
+    GrpcSendEndStream
+    // Reset the stream with this HTTP/2 error code.  What the host does
+    // when this package refuses something the peer sent.
+    GrpcSendReset(http2_code: Int)
+
+// One turn of the state machine.
+pub struct GrpcCallStep
+    call: GrpcCall
+    events: [GrpcCallEvent]
+    actions: [GrpcAction]
+
+// One call, both directions.
+//
+// Opaque on purpose.  Everything a caller needs is an accessor below,
+// and a field a caller reaches into is a field this package can never
+// change.
+pub struct GrpcCall
+    role: GrpcRole
+    method: GrpcMethodDesc
+    state: GrpcCallState
+    limits: GrpcLimits
+    incoming: GrpcDeframer
+    sent: Int
+    received: Int
+    trailers: ?GrpcTrailers
+
+// A call that has not started.
+//
+// The method descriptor is given here rather than at `start_request`
+// because a server knows which method it is serving before the first
+// byte arrives — it routed on the path — and a client knows before it
+// sends.
+//
+// ```novo
+// use grpccall
+// use grpcframe
+// use grpcsvc
+//
+// fn main() [io]
+//     let m = GrpcMethodDesc { service: ".acme.Orders", name: "Get",
+//         path: "/acme.Orders/Get", input_type: ".acme.GetReq",
+//         output_type: ".acme.Order", streaming: PbUnary }
+//     let c = grpccall.call(GrpcClientSide, m, grpcframe.default_limits())
+//     println(grpccall.state_name(grpccall.state_of(c)))   // IDLE
+// ```
+pub fn call(role: GrpcRole, m: GrpcMethodDesc, limits: GrpcLimits) -> GrpcCall []
+    todo("grpccall.call")
+
+// Where the call has got to.
+pub fn state_of(c: GrpcCall) -> GrpcCallState []
+    todo("grpccall.state_of")
+
+// The state's name, for a log line: `"IDLE"`, `"OPEN"`, `"CLOSED"`.
+pub fn state_name(s: GrpcCallState) -> Str []
+    todo("grpccall.state_name")
+
+// Whether this end has finished sending.
+pub fn half_closed_local(c: GrpcCall) -> Bool []
+    todo("grpccall.half_closed_local")
+
+// Whether the far end has finished sending.
+pub fn half_closed_remote(c: GrpcCall) -> Bool []
+    todo("grpccall.half_closed_remote")
+
+// How many messages this end has sent.
+pub fn sent_count(c: GrpcCall) -> Int []
+    todo("grpccall.sent_count")
+
+// How many messages have arrived.
+pub fn received_count(c: GrpcCall) -> Int []
+    todo("grpccall.received_count")
+
+// The trailers, once they have crossed.
+pub fn trailers_of(c: GrpcCall) -> ?GrpcTrailers []
+    todo("grpccall.trailers_of")
+
+// ── the client's side ───────────────────────────────────────────────
+
+// Open the call: answer the headers the host must send.
+//
+// The headers are the five the specification requires — `:method`
+// POST, `:scheme`, `:path` from the method descriptor, `:authority`,
+// `content-type` — plus `te: trailers`, plus `grpc-timeout` when a
+// deadline was given, plus the caller's own metadata.  `te: trailers`
+// is not decoration: it is how a client says it will read trailers,
+// and a server is entitled to refuse a request without it.
+//
+// `GrpcWrongState` when the call is not idle.
+pub fn start_request(c: GrpcCall, authority: Str, scheme: Str, md: GrpcMetadata,
+                     deadline: ?GrpcDeadline) -> Result<GrpcCallStep, GrpcEncodeError> []
+    todo("grpccall.start_request")
+
+// ── the server's side ───────────────────────────────────────────────
+
+// Answer the request headers: `:status` 200 and `content-type`, plus
+// the caller's own metadata.
+//
+// A server sends these BEFORE it knows whether the call will succeed,
+// which is exactly why the status is in the trailers.
+pub fn start_response(c: GrpcCall, md: GrpcMetadata) -> Result<GrpcCallStep, GrpcEncodeError> []
+    todo("grpccall.start_response")
+
+// End the call with a status and no messages at all.
+//
+// The TRAILERS-ONLY response: one HEADERS frame carrying `:status`
+// 200, the content type, `grpc-status` and `grpc-message`, with
+// `end_stream` set.  It is what a server answers for an unroutable
+// path or a failed authorisation, and it is legal ONLY when no
+// response headers have gone yet — which is why it is its own function
+// rather than a flag on `finish_response`.
+pub fn trailers_only(c: GrpcCall, t: GrpcTrailers,
+                     md: GrpcMetadata) -> Result<GrpcCallStep, GrpcEncodeError> []
+    todo("grpccall.trailers_only")
+
+// End the call with a status, after the response headers have gone.
+//
+// Servers only: the status is the server's to say, and a client that
+// wants to stop sends a reset instead.
+pub fn finish_response(c: GrpcCall, t: GrpcTrailers,
+                       md: GrpcMetadata) -> Result<GrpcCallStep, GrpcEncodeError> []
+    todo("grpccall.finish_response")
+
+// ── both sides ──────────────────────────────────────────────────────
+
+// Send one message: frame it and answer the DATA the host must write.
+//
+// `GrpcMessageTooLarge` past the limit, `GrpcWrongState` on a call that
+// is not open in this direction — a second request on a unary method, a
+// message after `half_close`, a response before the headers.  The
+// message COUNT is checked against the method's streaming shape, which
+// is why the descriptor is held by the call.
+//
+// The bytes handed over are already framed.  Compression is the host's:
+// pass `compressed` true when the host has already compressed the body
+// with whatever `grpc-encoding` named, and this sets the flag.
+pub fn send_message(c: GrpcCall, body: Bytes,
+                    compressed: Bool) -> Result<GrpcCallStep, GrpcEncodeError> []
+    todo("grpccall.send_message")
+
+// Say that this end will send no more messages.
+//
+// A client's half-close ends the request; a server half-closes by
+// sending its trailers, so this is a client's call and answers
+// `GrpcWrongState` on a server.
+pub fn half_close(c: GrpcCall) -> Result<GrpcCallStep, GrpcEncodeError> []
+    todo("grpccall.half_close")
+
+// Abandon the call: answer the reset the host must send.
+//
+// `CANCEL` in HTTP/2 terms, which the far end reads as
+// `grpcstatus.GrpcCancelled`.  What a client does when its caller gave
+// up, and the only way a client ends a call early.
+pub fn cancel(c: GrpcCall) -> GrpcCallStep []
+    todo("grpccall.cancel")
+
+// ── what arrived ────────────────────────────────────────────────────
+
+// The peer's headers arrived.
+//
+// Checks the content type, the metadata names, and — on a server — the
+// deadline; answers `GrpcHeadersIn`, or a refusal with the reset the
+// host should send.  A HEADERS frame carrying `grpc-status` is a
+// trailers-only response and produces `GrpcTrailersIn` and
+// `GrpcCallDone` instead, which is why a client may not simply assume
+// this is the response head.
+pub fn on_headers(c: GrpcCall, md: GrpcMetadata) -> Result<GrpcCallStep, GrpcDecodeError> []
+    todo("grpccall.on_headers")
+
+// DATA arrived: deframe it and answer every message that finished.
+//
+// A message split across DATA frames stays pending; several messages in
+// one frame all come out at once.  `end_stream` is HTTP/2's flag, and a
+// stream that ends mid-message is `GrpcFrameTruncated`.
+pub fn on_data(c: GrpcCall, chunk: [u8],
+               end_stream: Bool) -> Result<GrpcCallStep, GrpcDecodeError> []
+    todo("grpccall.on_data")
+
+// The peer's trailers arrived: the call has a status.
+//
+// `GrpcBadStatus` when `grpc-status` is absent or is not a number in
+// `0 ..= 16` — a call with no status is the one thing gRPC promises
+// cannot happen, so a stream that ends without one is a fault and not
+// an answer.
+pub fn on_trailers(c: GrpcCall, md: GrpcMetadata) -> Result<GrpcCallStep, GrpcDecodeError> []
+    todo("grpccall.on_trailers")
+
+// The stream was reset by the peer.
+//
+// Answers `GrpcCallDone` with the status
+// `grpcstatus.status_of_stream_reset` gives, because a reset call has
+// no trailers and a caller still needs an answer.  A `GrpcCallStep`
+// rather than a `Result`: a reset is something that happened, not
+// something this package can refuse.
+pub fn on_reset(c: GrpcCall, http2_code: Int) -> GrpcCallStep []
+    todo("grpccall.on_reset")
+
+// The connection went away under the call.
+//
+// Answers `GrpcCallDone` with `UNAVAILABLE`, which is what every
+// implementation reports and the one status a generic client may
+// retry.
+pub fn on_connection_lost(c: GrpcCall) -> GrpcCallStep []
+    todo("grpccall.on_connection_lost")
+
+// ── the header sets, built and read ─────────────────────────────────
+
+// The name-value pairs `start_request` produces, as metadata, so a host
+// can hand them to its own HPACK encoder.
+//
+// Pseudo-headers included, in the order HTTP/2 requires them: every
+// `:`-prefixed name first.  `grpcmeta.set` refuses a `:` name from an
+// application, and this is the one place they are written.
+pub fn request_headers(c: GrpcCall, authority: Str, scheme: Str, md: GrpcMetadata,
+                       deadline: ?GrpcDeadline) -> Result<GrpcMetadata, GrpcEncodeError> []
+    todo("grpccall.request_headers")
+
+// The name-value pairs a response head carries.
+pub fn response_headers(c: GrpcCall, md: GrpcMetadata) -> Result<GrpcMetadata, GrpcEncodeError> []
+    todo("grpccall.response_headers")
+
+// The name-value pairs a trailer set carries: `grpc-status`,
+// `grpc-message` when there is one, `grpc-status-details-bin` when
+// there is one, and the caller's own.
+pub fn trailer_headers(t: GrpcTrailers,
+                       md: GrpcMetadata) -> Result<GrpcMetadata, GrpcEncodeError> []
+    todo("grpccall.trailer_headers")
+
+// The trailers a header set carries.
+//
+// `GrpcBadStatus` when `grpc-status` is absent or unreadable.  The
+// `grpc-message` is percent-decoded on the way out, so a caller never
+// meets the encoded form.
+pub fn trailers_of_headers(md: GrpcMetadata) -> Result<GrpcTrailers, GrpcDecodeError> []
+    todo("grpccall.trailers_of_headers")
+
+// Whether a header set is a trailers-only response: it carries
+// `grpc-status` and arrived where the response head was expected.
+//
+// The one ambiguity in the protocol that a reader has to be told
+// about, because a client that assumed a HEADERS frame is the response
+// head will wait forever for a body that is never coming.
+pub fn is_trailers_only(md: GrpcMetadata) -> Bool []
+    todo("grpccall.is_trailers_only")

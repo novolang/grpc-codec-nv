@@ -1,0 +1,266 @@
+// grpcstatus — the seventeen codes, and the two trailers that carry
+// one.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// EVERY gRPC CALL ENDS WITH A STATUS, and it arrives in the TRAILERS
+// rather than in the response head.  That is the single fact that makes
+// gRPC need HTTP/2: a server that has streamed nine of ten responses
+// and then fails has already sent `:status: 200`, and the only place
+// left to say so is after the body.  HTTP/1.1's chunked trailers are
+// optional, frequently stripped by proxies, and unavailable at all on a
+// request — so the framing package for gRPC is not an HTTP/1.1 package.
+//
+// A STATUS IS NOT A TRANSPORT FAULT.  `NOT_FOUND` is a call that worked:
+// the frames parsed, the trailers arrived, the server answered.
+// `grpcerr.GrpcDecodeError` is the other thing, and the two are
+// different types here on purpose — confusing them is the most common
+// mistake in gRPC client code.
+//
+// THE MESSAGE IS PERCENT-ENCODED, which almost nobody expects.
+// `grpc-message` travels in an HTTP/2 header, so it may hold only
+// printable ASCII; the specification percent-encodes everything else,
+// including the `%` itself.  A client that printed the raw header value
+// would show `caf%C3%A9` for a message a server wrote as `café`.
+
+// The seventeen codes, in their own numeric order.
+//
+// The numbers are the wire's: `grpc-status: 5` is `GrpcNotFound`, and
+// the numbering is fixed by the specification rather than by this
+// package.
+pub enum GrpcStatus
+    // 0.  The call succeeded.  The only code that is not a failure, and
+    // the one a server sends by writing no `grpc-status` decision at
+    // all.
+    GrpcOk
+    // 1.  The caller cancelled, typically by dropping the call.
+    GrpcCancelled
+    // 2.  An error whose cause the server could not map onto any other
+    // code.  A server that answers this often has a bug rather than an
+    // unusual failure.
+    GrpcUnknown
+    // 3.  The arguments are wrong REGARDLESS OF STATE — a malformed
+    // name, a negative count.  `FAILED_PRECONDITION` is the one for
+    // arguments that are wrong given the state.
+    GrpcInvalidArgument
+    // 4.  The deadline passed.  It may have passed after the work
+    // succeeded, which is why a deadline is not proof that nothing
+    // happened.
+    GrpcDeadlineExceeded
+    // 5.  The thing asked for is not there.
+    GrpcNotFound
+    // 6.  The thing being created is already there.
+    GrpcAlreadyExists
+    // 7.  The caller is known and is not allowed.  `UNAUTHENTICATED` is
+    // the one for a caller who is not known.
+    GrpcPermissionDenied
+    // 8.  A quota, a rate limit, a disk.
+    GrpcResourceExhausted
+    // 9.  The system is not in a state where this can be done, and
+    // retrying without fixing that will not help.
+    GrpcFailedPrecondition
+    // 10.  A concurrency conflict — a transaction aborted, a
+    // check-and-set failed.  Retrying at a higher level may help.
+    GrpcAborted
+    // 11.  Past the end: a read beyond a file's length, a page past the
+    // last.  Distinct from `INVALID_ARGUMENT` so that a caller
+    // iterating can stop on it.
+    GrpcOutOfRange
+    // 12.  The method is not implemented, or not supported by this
+    // server.  What a server answers for a path it does not route.
+    GrpcUnimplemented
+    // 13.  An invariant this system depends on is broken.  Reserved for
+    // serious problems.
+    GrpcInternal
+    // 14.  The service is not available right now.  The one code a
+    // generic client may safely retry with a backoff.
+    GrpcUnavailable
+    // 15.  Data was lost or corrupted beyond recovery.
+    GrpcDataLoss
+    // 16.  The caller is not identified, or the credentials are bad.
+    GrpcUnauthenticated
+
+// The number this status travels as.
+//
+// ```novo
+// use grpcstatus
+//
+// fn main() [io]
+//     println("${grpcstatus.status_code(GrpcNotFound)}")   // 5
+// ```
+pub fn status_code(s: GrpcStatus) -> Int []
+    todo("grpcstatus.status_code")
+
+// The status a number names, or `None` for anything outside
+// `0 ..= 16`.
+//
+// `None` rather than `GrpcUnknown`: a `grpc-status` this package cannot
+// read is a protocol fault the caller should hear about, and folding it
+// onto code 2 would hide a peer that is speaking a later version.
+pub fn status_of_code(code: Int) -> ?GrpcStatus []
+    todo("grpcstatus.status_of_code")
+
+// The name the specification gives this status: `"NOT_FOUND"`,
+// `"OK"`, `"DEADLINE_EXCEEDED"`.
+//
+// Upper snake case because that is what every other implementation
+// logs, and a log line that does not match the one from the service at
+// the far end is a log line nobody can grep.
+//
+// ```novo
+// use grpcstatus
+//
+// fn main() [io]
+//     println(grpcstatus.status_name(GrpcFailedPrecondition))
+//     // FAILED_PRECONDITION
+// ```
+pub fn status_name(s: GrpcStatus) -> Str []
+    todo("grpcstatus.status_name")
+
+// The status a name spells, or `None`.
+//
+// For a configuration file that names a retryable set, and for a test
+// fixture.
+pub fn status_of_name(name: Str) -> ?GrpcStatus []
+    todo("grpcstatus.status_of_name")
+
+// Whether a generic client may retry a call that ended this way
+// without knowing anything about the method.
+//
+// True for `UNAVAILABLE` alone.  `DEADLINE_EXCEEDED` is deliberately
+// false — the deadline may have passed after the work succeeded, so a
+// retry can do it twice — and `ABORTED` is false because the retry
+// belongs at the level that knows what the transaction was.  A method
+// that is idempotent may say otherwise, and that is the caller's
+// knowledge rather than this package's.
+pub fn is_retryable(s: GrpcStatus) -> Bool []
+    todo("grpcstatus.is_retryable")
+
+// The status an HTTP response code maps to when a stream ends with an
+// HTTP status and no `grpc-status` at all.
+//
+// The specification's own table, which exists because a proxy or a load
+// balancer between the two ends can answer HTTP without ever having
+// spoken gRPC: 400 is `INTERNAL`, 401 `UNAUTHENTICATED`, 403
+// `PERMISSION_DENIED`, 404 `UNIMPLEMENTED`, 429, 502, 503 and 504
+// `UNAVAILABLE`, and everything else `UNKNOWN`.
+//
+// ```novo
+// use grpcstatus
+//
+// fn main() [io]
+//     println(grpcstatus.status_name(grpcstatus.status_of_http(503)))
+//     // UNAVAILABLE
+// ```
+pub fn status_of_http(http_code: Int) -> GrpcStatus []
+    todo("grpcstatus.status_of_http")
+
+// The status an HTTP/2 stream reset maps to.
+//
+// The host owns HTTP/2 and hands the error code over as a number; the
+// table is the specification's — `REFUSED_STREAM` and `ENHANCE_YOUR_
+// CALM` are `UNAVAILABLE` and `RESOURCE_EXHAUSTED`, `CANCEL` is
+// `CANCELLED`, and the rest are `INTERNAL`.
+pub fn status_of_stream_reset(http2_code: Int) -> GrpcStatus []
+    todo("grpcstatus.status_of_stream_reset")
+
+// The status to answer a decode refusal with, and close the stream.
+//
+// The whole point of the function: an endpoint that finds a malformed
+// frame should not have to choose between seventeen codes with a
+// specification open beside it.  A framing fault is `INTERNAL`, a
+// message past the limit `RESOURCE_EXHAUSTED`, a bad content type or
+// bad metadata `INVALID_ARGUMENT` (or `INTERNAL` on the client side,
+// where the server produced it), a missing `grpc-status` `UNKNOWN`, a
+// stream reset whatever `status_of_stream_reset` says.
+pub fn status_of_decode_error(e: GrpcDecodeError) -> GrpcStatus []
+    todo("grpcstatus.status_of_decode_error")
+
+// ── the trailers ────────────────────────────────────────────────────
+
+// How a call ended.
+//
+// `details` is `grpc-status-details-bin`, the base64 of an encoded
+// `google.rpc.Status` message: the structured half of an error, which
+// carries typed detail messages a client can match on.  It is `?Bytes`
+// and not a decoded value because decoding it needs a descriptor for
+// whatever the server put in it, which only the caller has.
+pub struct GrpcTrailers
+    status: GrpcStatus
+    // The `grpc-message`, ALREADY DECODED from its percent-encoded
+    // form.  Empty when the status is `GrpcOk`, and usually empty
+    // otherwise too — most servers send a code and nothing else.
+    message: Str
+    // `grpc-status-details-bin`, base64-decoded, or `None`.
+    details: ?Bytes
+
+// The trailers for a status and a message.
+//
+// ```novo
+// use grpcstatus
+//
+// fn main() [io]
+//     let t = grpcstatus.trailers(GrpcNotFound, "no such order")
+//     println("${grpcstatus.status_code(t.status)} ${t.message}")
+//     // 5 no such order
+// ```
+pub fn trailers(s: GrpcStatus, message: Str) -> GrpcTrailers []
+    todo("grpcstatus.trailers")
+
+// The trailers a successful call ends with: `OK` and nothing else.
+pub fn ok_trailers() -> GrpcTrailers []
+    todo("grpcstatus.ok_trailers")
+
+// Whether these trailers say the call succeeded.
+pub fn is_ok(t: GrpcTrailers) -> Bool []
+    todo("grpcstatus.is_ok")
+
+// Percent-encode a message for the `grpc-message` header.
+//
+// The header may hold only printable ASCII — `0x20 ..= 0x7e` — so
+// everything else becomes `%XX` over the UTF-8 bytes, and `%` itself
+// becomes `%25`.  Almost nobody expects this, and a client that printed
+// the raw header would show `caf%C3%A9` for a message a server wrote as
+// `café`.
+//
+// ```novo
+// use grpcstatus
+//
+// fn main() [io]
+//     println(grpcstatus.encode_message("café"))   // caf%C3%A9
+// ```
+pub fn encode_message(text: Str) -> Str []
+    todo("grpcstatus.encode_message")
+
+// Decode a `grpc-message` header value.
+//
+// Lenient by specification: a `%` that is not followed by two hex
+// digits is kept as a literal `%` rather than refused, because a
+// message is diagnostic text and refusing to read one would turn a
+// server's bad error string into a client's transport failure.
+//
+// ```novo
+// use grpcstatus
+//
+// fn main() [io]
+//     println(grpcstatus.decode_message("caf%C3%A9 100%"))   // café 100%
+// ```
+pub fn decode_message(text: Str) -> Str []
+    todo("grpcstatus.decode_message")
+
+// The header name the status travels under: `"grpc-status"`.
+//
+// Named rather than spelled at each call site, because a typo in a
+// header name is a call that never ends rather than a call that fails.
+pub fn status_header() -> Str []
+    todo("grpcstatus.status_header")
+
+// The header name the message travels under: `"grpc-message"`.
+pub fn message_header() -> Str []
+    todo("grpcstatus.message_header")
+
+// The header name the structured details travel under:
+// `"grpc-status-details-bin"`.
+pub fn details_header() -> Str []
+    todo("grpcstatus.details_header")

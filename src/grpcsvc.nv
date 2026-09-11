@@ -1,0 +1,194 @@
+// grpcsvc — what a service is, over protobuf-nv's descriptors.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// A gRPC METHOD IS A PATH.  `/package.Service/Method` — the leading
+// slash, the service's fully-qualified name WITHOUT its leading dot,
+// another slash, the method's simple name.  That string is the HTTP/2
+// `:path` pseudo-header and is the whole of how a server routes a
+// call.  `path_of` builds one and `parse_path` reads one, and having
+// both as functions rather than as string handling at each call site is
+// what keeps a router and a client agreeing.
+//
+// THE DESCRIPTORS ARE protobuf-nv's.  `PbService`, `PbMethod` and
+// `PbStreaming` come from there, so a caller that parsed a descriptor
+// set — or fetched one from a reflection service thirty milliseconds
+// ago — hands the same values here rather than re-deriving them.  This
+// module adds the two facts protobuf does not have: the path, and the
+// message encoding.
+//
+// THE FOUR STREAMING SHAPES ARE PROTOBUF'S TWO BOOLEANS, NAMED.
+// `client_streaming` and `server_streaming` are two flags in the
+// descriptor, and "client streaming and not server streaming" is not
+// how anyone says it.  `PbStreaming` is the four combinations with
+// names on, and it is protobuf-nv's type because the descriptor is
+// where the flags live.
+
+// One method, with the two facts a call needs that a descriptor does
+// not carry.
+pub struct GrpcMethodDesc
+    // The service's fully-qualified name, leading dot included:
+    // `.acme.Orders`.  The descriptor's own spelling, so a lookup back
+    // into a `PbFileSet` is this string and no surgery.
+    service: Str
+    // The method's simple name: `Get`.
+    name: Str
+    // `/acme.Orders/Get` — the `:path` this method is called at.  Held
+    // rather than derived at each call because a router compares it
+    // once per request.
+    path: Str
+    // The request message's fully-qualified name.
+    input_type: Str
+    // The response message's fully-qualified name.
+    output_type: Str
+    // Which of the four shapes.
+    streaming: PbStreaming
+
+// One service.
+pub struct GrpcServiceDesc
+    // The fully-qualified name, leading dot included: `.acme.Orders`.
+    full_name: Str
+    methods: [GrpcMethodDesc]
+
+// The two halves of a `:path`.
+pub struct GrpcPathParts
+    // WITHOUT the leading dot, because that is how the path spells it:
+    // `acme.Orders`.
+    service: Str
+    method: Str
+
+// The `:path` a method is called at.
+//
+// `service_full_name` is the descriptor's spelling, leading dot and
+// all; the leading dot is dropped here, because the path does not carry
+// it and a server that compared the two forms would route nothing.
+//
+// ```novo
+// use grpcsvc
+//
+// fn main() [io]
+//     println(grpcsvc.path_of(".acme.Orders", "Get"))   // /acme.Orders/Get
+// ```
+pub fn path_of(service_full_name: Str, method_name: Str) -> Str []
+    todo("grpcsvc.path_of")
+
+// The service and method a `:path` names, or `None` when the string is
+// not two non-empty segments behind a leading slash.
+//
+// `None` rather than a refusal: an unroutable path is answered with
+// `UNIMPLEMENTED` and a closed stream, which is the caller's decision
+// to make, and a `Result` here would push a transport error type into
+// a router that has none.
+//
+// ```novo
+// use grpcsvc
+//
+// fn main() [io]
+//     match grpcsvc.parse_path("/acme.Orders/Get")
+//         Some(p) => println("${p.service} ${p.method}")   // acme.Orders Get
+//         None    => println("not a gRPC path")
+// ```
+pub fn parse_path(path: Str) -> ?GrpcPathParts []
+    todo("grpcsvc.parse_path")
+
+// The fully-qualified name — leading dot included — for a path's
+// service half.
+//
+// The inverse of `path_of`'s dot-dropping, so a router that parsed a
+// path can look the service up in the descriptor set it came from.
+pub fn full_name_of_path_service(service: Str) -> Str []
+    todo("grpcsvc.full_name_of_path_service")
+
+// Every service a descriptor set declares, with its methods' paths
+// filled in.
+//
+// What a server calls once at startup to build its routing table, and
+// what a reflection-driven client calls on the descriptor it just
+// fetched.
+pub fn services_of(set: PbFileSet) -> [GrpcServiceDesc] []
+    todo("grpcsvc.services_of")
+
+// One service by fully-qualified name, or `None`.
+pub fn service_of(set: PbFileSet, full_name: Str) -> ?GrpcServiceDesc []
+    todo("grpcsvc.service_of")
+
+// One method of a service by simple name, or `None`.
+pub fn method_of(svc: GrpcServiceDesc, name: Str) -> ?GrpcMethodDesc []
+    todo("grpcsvc.method_of")
+
+// One method by the `:path` a request arrived at, or `None`.
+//
+// The router's own lookup: parse the path, find the service, find the
+// method, in one call, because a router that did it in three would have
+// three places to get the dot wrong.
+pub fn method_of_path(set: PbFileSet, path: Str) -> ?GrpcMethodDesc []
+    todo("grpcsvc.method_of_path")
+
+// The method descriptor for one `PbMethod` of one `PbService`.
+//
+// The bridge for a caller that already walked the descriptor itself.
+pub fn method_desc(svc: PbService, m: PbMethod) -> GrpcMethodDesc []
+    todo("grpcsvc.method_desc")
+
+// Whether the client may send more than one message.
+//
+// ```novo
+// use grpcsvc
+//
+// fn main() [io]
+//     let m = GrpcMethodDesc { service: ".acme.Orders", name: "Watch",
+//         path: "/acme.Orders/Watch", input_type: ".acme.WatchReq",
+//         output_type: ".acme.Order", streaming: PbServerStream }
+//     let c = grpcsvc.client_streams(m)
+//     let s = grpcsvc.server_streams(m)
+//     println("${c} ${s}")   // false true
+// ```
+pub fn client_streams(m: GrpcMethodDesc) -> Bool []
+    todo("grpcsvc.client_streams")
+
+// Whether the server may send more than one message.
+pub fn server_streams(m: GrpcMethodDesc) -> Bool []
+    todo("grpcsvc.server_streams")
+
+// How many messages the client may send: 1 for unary and server
+// streaming, -1 for the two client-streaming shapes.
+//
+// -1 rather than a large number, so that a state machine comparing
+// against it cannot be made to pass by a peer sending enough.
+pub fn request_count(m: GrpcMethodDesc) -> Int []
+    todo("grpcsvc.request_count")
+
+// How many messages the server may send: 1 for unary and client
+// streaming, -1 for the two server-streaming shapes.
+pub fn response_count(m: GrpcMethodDesc) -> Int []
+    todo("grpcsvc.response_count")
+
+// ── the reflection service, named ───────────────────────────────────
+
+// The fully-qualified name of gRPC's own reflection service:
+// `".grpc.reflection.v1.ServerReflection"`.
+//
+// Named here because it is the service a dynamic client calls FIRST,
+// before it knows anything: it asks the server for the descriptors of
+// everything else.  This package does not implement it — that is
+// messages over this framing, and a program that has this package can
+// write it — and naming it is what tells a reader where to start.
+pub fn reflection_service_name() -> Str []
+    todo("grpcsvc.reflection_service_name")
+
+// The path of the reflection service's one method:
+// `"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"`.
+//
+// A bidirectional streaming method, which is why a reflection client
+// needs the whole call state machine rather than a unary shortcut.
+pub fn reflection_method_path() -> Str []
+    todo("grpcsvc.reflection_method_path")
+
+// The fully-qualified name of gRPC's health checking service:
+// `".grpc.health.v1.Health"`.
+//
+// The other service every deployment has, and the one a load balancer
+// calls.  Named for the same reason.
+pub fn health_service_name() -> Str []
+    todo("grpcsvc.health_service_name")

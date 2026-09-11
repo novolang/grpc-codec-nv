@@ -1,0 +1,250 @@
+// grpcframe — five bytes in front of every message, and the deframer
+// that reads them back.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE WHOLE FRAMING, IN ONE PARAGRAPH.  An HTTP/2 DATA stream carries
+// zero or more LENGTH-PREFIXED MESSAGES, and the prefix is five bytes:
+// one COMPRESSED FLAG, then a four-byte BIG-ENDIAN length.  That is
+// all of it.  A message may be split across any number of DATA frames
+// and several messages may share one, so the deframer is a state
+// machine over a byte stream and not a reader of frames.
+//
+// BIG-ENDIAN, WHICH IS WORTH SAYING OUT LOUD, because the protobuf
+// message inside the frame is little-endian throughout and a reader
+// who has been staring at one of those will reach for the wrong
+// helper.  The length is network order; protobuf's `fixed32` is not.
+//
+// THE FLAG SAYS THAT, NOT WITH WHAT.  A 1 means the message body is
+// compressed with whatever `grpc-encoding` named on the stream, and
+// this package does not decompress: the bytes go to the host, which
+// inflates them with flate-nv or whatever the header said.  A codec
+// that compressed would be choosing an algorithm for a protocol whose
+// point is that the two ends negotiate one.  A flag of 1 on a stream
+// that named no encoding is `GrpcCompressedWithoutEncoding`, because
+// the alternative is handing a caller bytes nobody can read.
+//
+// THE LIMIT IS CHECKED BEFORE ANYTHING IS RESERVED.  A length prefix is
+// an allocation instruction from whoever sent it, and four bytes can
+// ask for four gigabytes.  `GrpcLimits.max_message` is the number, and
+// it is the same number every gRPC implementation exposes as
+// `maxReceiveMessageLength`.
+
+use std.bytes
+
+// What a deframer will not do, whatever it is asked.
+pub struct GrpcLimits
+    // The most bytes one message may occupy, body only — the five
+    // header bytes are not counted, which is what every other
+    // implementation does.  4 MiB by default, which is gRPC's own
+    // default and the reason so many services fail at exactly
+    // 4,194,304 bytes.
+    max_message: Int
+    // The most bytes the deframer will hold while waiting for the rest
+    // of a message.  Equal to `max_message` plus the header by
+    // default; a caller that streams very large messages through a
+    // small machine lowers it and drains more often.
+    max_pending: Int
+
+// The limits every gRPC implementation starts from: a 4 MiB message.
+//
+// ```novo
+// use grpcframe
+//
+// fn main() [io]
+//     println("${grpcframe.default_limits().max_message}")   // 4194304
+// ```
+pub fn default_limits() -> GrpcLimits []
+    todo("grpcframe.default_limits")
+
+// The limits for a server that will not be asked to hold much: a
+// 64 KiB message.
+//
+// Named rather than left to a caller to assemble, because the numbers
+// that matter are the ones somebody chose on purpose.
+pub fn small_limits() -> GrpcLimits []
+    todo("grpcframe.small_limits")
+
+// The five-byte prefix, read.
+//
+// NOT a `@value` struct, and the reason is a language rule rather than
+// a preference: reading a header is fallible — five bytes may not have
+// arrived, and the flag may be neither 0 nor 1 — so the result is a
+// `Result<GrpcFrameHead, GrpcDecodeError>`, and a `@value` struct
+// cannot be a `Result` payload (E2015: it is unboxed, and that
+// position has no unboxed lowering).  Two integers in a boxed struct
+// is what a fallible read costs, and the allocation-free path for a
+// caller who needs one is `write_header_into` on the way out and the
+// deframer's own state on the way in.
+pub struct GrpcFrameHead
+    // The compressed flag as it arrived: 0 or 1, and never anything
+    // else — a deframer refuses the other 254 values.
+    flag: Int
+    // The body's length in bytes, from the four big-endian bytes.
+    len: Int
+
+// How many bytes a frame's header occupies: 5.
+pub fn header_len() -> Int []
+    todo("grpcframe.header_len")
+
+// The largest length four bytes can announce: 4,294,967,295.
+//
+// Not a limit anyone should use — `GrpcLimits.max_message` is the one
+// that matters — and here because it is the bound a reader must not
+// overflow past.
+pub fn max_encodable_len() -> Int []
+    todo("grpcframe.max_encodable_len")
+
+// How many bytes a framed message of `body_len` occupies: `body_len`
+// plus five.
+//
+// ```novo
+// use grpcframe
+//
+// fn main() [io]
+//     println("${grpcframe.framed_len(3)}")   // 8
+// ```
+pub fn framed_len(body_len: Int) -> Int []
+    todo("grpcframe.framed_len")
+
+// Write one frame header into the caller's buffer, and answer the byte
+// count.
+//
+// `GrpcBufferTooSmall` when the cursor has less than five bytes left;
+// nothing here allocates and nothing here grows.
+//
+// ```novo
+// use std.bytes
+// use grpcframe
+//
+// fn main() [io]
+//     var c = bytes.cursor_be(bytes.zeros(5))
+//     match grpcframe.write_header_into(false, 3, c)
+//         Ok(n)  => println("${n}")   // 5
+//         Err(e) => println(e.message())
+// ```
+pub fn write_header_into(compressed: Bool, body_len: Int,
+                         mut dst: Cursor) -> Result<Int, GrpcEncodeError> []
+    todo("grpcframe.write_header_into")
+
+// Read one frame header at `off`.
+//
+// `GrpcFrameTruncated` for fewer than five bytes,
+// `GrpcBadCompressedFlag` for a flag outside `0 ..= 1`.  The LIMIT is
+// not applied here — this function answers what the bytes say, and the
+// deframer is what refuses.
+pub fn read_header_at(src: Bytes, off: Int) -> Result<GrpcFrameHead, GrpcDecodeError> []
+    todo("grpcframe.read_header_at")
+
+// One whole framed message: its header and its body, allocated.
+//
+// The convenience for a caller that has the body and wants the bytes
+// to hand to the host.  `write_header_into` plus the caller's own copy
+// is the allocation-free path.
+//
+// ```novo
+// use std.bytes
+// use grpcframe
+//
+// fn main() [io]
+//     let body = bytes.from_hex("089601") ?? bytes.zeros(0)
+//     match grpcframe.frame(body, false, grpcframe.default_limits())
+//         Ok(out) => println(bytes.to_hex(out))   // 0000000003089601
+//         Err(e)  => println(e.message())
+// ```
+pub fn frame(body: Bytes, compressed: Bool, limits: GrpcLimits) -> Result<Bytes, GrpcEncodeError> []
+    todo("grpcframe.frame")
+
+// ── the deframer ────────────────────────────────────────────────────
+
+// One message, drained.
+pub struct GrpcMessage
+    // Whether the body still needs inflating.  The host does that, with
+    // whatever `grpc-encoding` named.
+    compressed: Bool
+    // The body, header excluded.
+    body: Bytes
+
+// The state of a byte stream being cut into messages.
+//
+// Opaque on purpose.  Everything a caller needs is an accessor below,
+// and a field a caller reaches into is a field this package can never
+// change.
+pub struct GrpcDeframer
+    limits: GrpcLimits
+    pending: Bytes
+    offset: Int
+    want: Int
+
+// A fresh deframer over one stream direction.
+//
+// One per direction, because a bidirectional call has two independent
+// message streams and sharing a deframer between them would interleave
+// two halves of two messages.
+pub fn deframer(limits: GrpcLimits) -> GrpcDeframer []
+    todo("grpcframe.deframer")
+
+// One turn of the deframer: the deframer after the step, the messages
+// that finished, and how many more bytes the one in progress needs.
+//
+// `need` is exact rather than a hint, which is the difference between
+// this and a format whose lengths are varints: the five-byte header
+// says how long the body is, so once a header has arrived the deframer
+// knows precisely what it is waiting for.  It is 5 before a header and
+// 0 when the deframer is between messages.
+pub struct GrpcDeframeStep
+    deframer: GrpcDeframer
+    messages: [GrpcMessage]
+    need: Int
+
+// Feed a chunk of DATA and take every message that finished.
+//
+// A message split across chunks stays pending until the rest arrives;
+// several messages in one chunk all come out at once.  A chunk that
+// finishes nothing is an empty list and not an error — on a stream that
+// is the ordinary case.
+//
+// ```novo
+// use std.bytes
+// use grpcframe
+//
+// fn main() [io]
+//     let wire = bytes.from_hex("0000000003089601") ?? bytes.zeros(0)
+//     let d = grpcframe.deframer(grpcframe.default_limits())
+//     match grpcframe.feed(d, bytes.to_byte_list(wire))
+//         Ok(s)  => println("${s.messages.len()} ${s.need}")   // 1 0
+//         Err(e) => println(e.message())
+// ```
+pub fn feed(d: GrpcDeframer, chunk: [u8]) -> Result<GrpcDeframeStep, GrpcDecodeError> []
+    todo("grpcframe.feed")
+
+// Say that this direction of the stream has ended.
+//
+// Bytes still pending are `GrpcFrameTruncated`.  A stream that ends
+// exactly on a message boundary answers a step with nothing in it,
+// which is the ordinary end of a call.
+pub fn finish(d: GrpcDeframer) -> Result<GrpcDeframeStep, GrpcDecodeError> []
+    todo("grpcframe.finish")
+
+// How many bytes the deframer has consumed since it was made.
+//
+// The number every `GrpcDecodeError`'s `at` is counted in.
+pub fn offset(d: GrpcDeframer) -> Int []
+    todo("grpcframe.offset")
+
+// How many fed bytes are waiting for the rest of their message.
+pub fn pending_len(d: GrpcDeframer) -> Int []
+    todo("grpcframe.pending_len")
+
+// Whether the deframer is between messages, and so would accept
+// `finish` without refusing.
+pub fn at_boundary(d: GrpcDeframer) -> Bool []
+    todo("grpcframe.at_boundary")
+
+// Every message in a buffer the caller already holds entirely.
+//
+// The convenience over `feed` and `finish` for a unary call, where the
+// whole body arrived in one piece.
+pub fn deframe_all(src: Bytes, limits: GrpcLimits) -> Result<[GrpcMessage], GrpcDecodeError> []
+    todo("grpcframe.deframe_all")

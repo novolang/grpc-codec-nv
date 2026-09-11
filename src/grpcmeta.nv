@@ -1,0 +1,328 @@
+// grpcmeta — the headers a call carries, the content type that names
+// the protocol, and the deadline that travels with every request.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// METADATA IS HTTP/2 HEADERS, WITH THREE EXTRA RULES.  Names are lower
+// case — HTTP/2 requires it, and a name with a capital in it is a name
+// the far end will not find.  Names beginning `grpc-` are the
+// protocol's own and an application may not set one.  A name ending
+// `-bin` carries ARBITRARY BYTES, base64-encoded in the header and
+// handed to a caller decoded; every other name carries printable ASCII
+// and nothing else.
+//
+// WHY NOT http-codec-nv's `H1Headers`.  Because these are not HTTP/1.1
+// headers: 1.1 folds case, allows obs-fold continuation lines, and has
+// no `-bin` convention.  Borrowing the type would mean borrowing rules
+// that are wrong here, and `docs/publishing.md` § Public type names are
+// globally unique would make the borrowed one a shared name besides.
+//
+// THE DEADLINE IS A DURATION, NOT AN INSTANT, and that is the design
+// decision worth knowing.  `grpc-timeout: 100m` means "a hundred
+// milliseconds from when you receive this", so the two ends need no
+// agreement about the clock at all — which is what lets a call cross a
+// machine whose time is wrong.  It also means a proxy must DECREMENT
+// the header as it forwards, and `remaining` is that arithmetic.
+//
+// A `core` PACKAGE HAS NO CLOCK, so nothing here reads the time.
+// `remaining` takes the elapsed nanoseconds as a parameter, the same
+// way a gzip header's mtime is a parameter, and the host is the only
+// party that knows what time it is.
+
+use std.bytes
+
+// One header of one call.
+pub struct GrpcMetaEntry
+    // Lower case, and never beginning `grpc-` when an application set
+    // it.
+    name: Str
+    // The value.  For a `-bin` name this is the DECODED bytes as a
+    // `Str`; `is_binary` says which it is, and the base64 happens at
+    // the edge.
+    value: Str
+    // Whether the name ends `-bin`, and so whether the value is bytes
+    // rather than text.  Derived from the name by `is_binary_name` and
+    // carried so that a caller iterating does not have to re-derive it.
+    is_binary: Bool
+
+// The headers of one call, in the order they were set.
+//
+// Order is kept because HTTP/2 keeps it for repeated names, and a
+// caller reading `get_all` on a repeated key gets the order the peer
+// sent.
+pub struct GrpcMetadata
+    entries: [GrpcMetaEntry]
+
+// Metadata with nothing in it.
+//
+// ```novo
+// use grpcmeta
+//
+// fn main() [io]
+//     println("${grpcmeta.count(grpcmeta.empty())}")   // 0
+// ```
+pub fn empty() -> GrpcMetadata []
+    todo("grpcmeta.empty")
+
+// Metadata built from a list of entries.
+pub fn metadata(entries: [GrpcMetaEntry]) -> GrpcMetadata []
+    todo("grpcmeta.metadata")
+
+// The first value under this name, or `None`.
+pub fn get(md: GrpcMetadata, name: Str) -> ?Str []
+    todo("grpcmeta.get")
+
+// Every value under this name, in the order they arrived.
+pub fn get_all(md: GrpcMetadata, name: Str) -> [Str] []
+    todo("grpcmeta.get_all")
+
+// Whether anything is set under this name.
+pub fn has(md: GrpcMetadata, name: Str) -> Bool []
+    todo("grpcmeta.has")
+
+// Replace every value under this name with one.
+//
+// `GrpcReservedMetadataName` for a `grpc-` or `:`-prefixed name, and
+// `GrpcInvalidMetadataName` for one with a character the protocol does
+// not allow.  Refused rather than corrected: a name silently
+// lower-cased is a name the caller will search for and not find.
+pub fn set(md: GrpcMetadata, name: Str, value: Str) -> Result<GrpcMetadata, GrpcEncodeError> []
+    todo("grpcmeta.set")
+
+// Add a value under this name, keeping what was there.
+//
+// What a repeated header is: `authorization` once, `x-trace-tag` five
+// times.
+pub fn append(md: GrpcMetadata, name: Str, value: Str) -> Result<GrpcMetadata, GrpcEncodeError> []
+    todo("grpcmeta.append")
+
+// Drop every value under this name.
+pub fn remove(md: GrpcMetadata, name: Str) -> GrpcMetadata []
+    todo("grpcmeta.remove")
+
+// Every entry, in order.
+pub fn entries_of(md: GrpcMetadata) -> [GrpcMetaEntry] []
+    todo("grpcmeta.entries_of")
+
+// How many entries there are, repeated names counted once each time.
+pub fn count(md: GrpcMetadata) -> Int []
+    todo("grpcmeta.count")
+
+// ── the three name rules ────────────────────────────────────────────
+
+// Whether a name is one an application may use.
+//
+// Lower-case ASCII letters, digits, `-`, `_` and `.`, at least one
+// character, not beginning `grpc-` and not beginning `:`.  The last two
+// are the reservations: `grpc-` is the protocol's, `:` is HTTP/2's
+// pseudo-header space.
+//
+// ```novo
+// use grpcmeta
+//
+// fn main() [io]
+//     let a = grpcmeta.is_valid_name("x-trace-id")
+//     let b = grpcmeta.is_valid_name("X-Trace-Id")
+//     println("${a} ${b}")   // true false
+// ```
+pub fn is_valid_name(name: Str) -> Bool []
+    todo("grpcmeta.is_valid_name")
+
+// Whether a name belongs to the protocol rather than to an
+// application: it begins `grpc-`, or `:`.
+pub fn is_reserved_name(name: Str) -> Bool []
+    todo("grpcmeta.is_reserved_name")
+
+// Whether a name ends `-bin`, and so carries bytes.
+//
+// The convention is the whole of how gRPC puts arbitrary octets in a
+// header: the suffix is the type tag, base64 is the encoding, and there
+// is no other signal.
+//
+// ```novo
+// use grpcmeta
+//
+// fn main() [io]
+//     let b = grpcmeta.is_binary_name("trace-context-bin")
+//     println("${b}")   // true
+// ```
+pub fn is_binary_name(name: Str) -> Bool []
+    todo("grpcmeta.is_binary_name")
+
+// Whether a value may travel under a text name: printable ASCII,
+// `0x20 ..= 0x7e`, and nothing else.
+pub fn is_valid_text_value(value: Str) -> Bool []
+    todo("grpcmeta.is_valid_text_value")
+
+// ── the content type ────────────────────────────────────────────────
+
+// The content type every gRPC request and response carries:
+// `"application/grpc"`.
+pub fn content_type() -> Str []
+    todo("grpcmeta.content_type")
+
+// The content type for a named message encoding:
+// `content_type_for("proto")` is `"application/grpc+proto"`.
+//
+// The subtype names what is INSIDE the frames, and protobuf is only
+// the usual answer — `+json` is a real deployment, and a service that
+// speaks both reads this to find out which it was sent.
+pub fn content_type_for(subtype: Str) -> Str []
+    todo("grpcmeta.content_type_for")
+
+// Whether a `content-type` value is gRPC's.
+//
+// True for `application/grpc`, for `application/grpc+<anything>`, and
+// for either followed by parameters after a `;`.  A value that is not
+// is `GrpcBadContentType` — a specific refusal rather than a generic
+// one, because it is what a proxy that rewrote the header looks like
+// from here.
+pub fn is_grpc_content_type(value: Str) -> Bool []
+    todo("grpcmeta.is_grpc_content_type")
+
+// The message encoding a content type names: `"proto"` for
+// `application/grpc+proto`, and `"proto"` for bare `application/grpc`
+// too, because that is what the specification says the default is.
+//
+// ```novo
+// use grpcmeta
+//
+// fn main() [io]
+//     println(grpcmeta.message_subtype("application/grpc"))   // proto
+// ```
+pub fn message_subtype(value: Str) -> Str []
+    todo("grpcmeta.message_subtype")
+
+// The header name the message encoding travels under:
+// `"grpc-encoding"`.
+//
+// What `identity`, `gzip` or `deflate` is written in, and what a
+// frame's compressed flag refers to.  This package does not compress;
+// the name is here so the host can find what it must.
+pub fn encoding_header() -> Str []
+    todo("grpcmeta.encoding_header")
+
+// The header name the acceptable encodings travel under:
+// `"grpc-accept-encoding"`.
+pub fn accept_encoding_header() -> Str []
+    todo("grpcmeta.accept_encoding_header")
+
+// ── the deadline ────────────────────────────────────────────────────
+
+// Which unit a `grpc-timeout` is counted in.
+//
+// Six of them, because the value is at most eight digits and one unit
+// has to cover everything from a nanosecond to a hundred hours.
+pub enum GrpcTimeoutUnit
+    // `H` — hours.
+    GrpcHours
+    // `M` — minutes.
+    GrpcMinutes
+    // `S` — seconds.
+    GrpcSeconds
+    // `m` — milliseconds.  Lower case, against `M` for minutes, and
+    // getting the two the wrong way round is a call that times out
+    // sixty thousand times too late.
+    GrpcMilliseconds
+    // `u` — microseconds.
+    GrpcMicroseconds
+    // `n` — nanoseconds.
+    GrpcNanoseconds
+
+// A deadline as it travels: a count and a unit.
+//
+// NOT an instant.  `grpc-timeout: 100m` means "a hundred milliseconds
+// from when you receive this", so the two ends need no agreement about
+// the clock — which is what lets a call cross a machine whose time is
+// wrong.
+pub struct GrpcDeadline
+    value: Int
+    unit: GrpcTimeoutUnit
+
+// The character a unit is spelled with.
+//
+// ```novo
+// use grpcmeta
+//
+// fn main() [io]
+//     let a = grpcmeta.unit_char(GrpcMinutes)
+//     let b = grpcmeta.unit_char(GrpcMilliseconds)
+//     println("${a} ${b}")   // M m
+// ```
+pub fn unit_char(u: GrpcTimeoutUnit) -> Str []
+    todo("grpcmeta.unit_char")
+
+// The unit a character spells, or `None`.
+pub fn unit_of_char(c: Str) -> ?GrpcTimeoutUnit []
+    todo("grpcmeta.unit_of_char")
+
+// How many nanoseconds one of this unit is.
+pub fn unit_nanos(u: GrpcTimeoutUnit) -> Int []
+    todo("grpcmeta.unit_nanos")
+
+// The most digits a `grpc-timeout` value may have: 8.
+//
+// The bound is the specification's, and it is the reason six units
+// exist: eight digits of nanoseconds is a tenth of a second, and eight
+// digits of hours is eleven thousand years.
+pub fn max_timeout_digits() -> Int []
+    todo("grpcmeta.max_timeout_digits")
+
+// The deadline as a header value: the digits, then the unit character.
+//
+// ```novo
+// use grpcmeta
+//
+// fn main() [io]
+//     println(grpcmeta.deadline_text(GrpcDeadline { value: 100, unit: GrpcMilliseconds }))
+//     // 100m
+// ```
+pub fn deadline_text(d: GrpcDeadline) -> Str []
+    todo("grpcmeta.deadline_text")
+
+// The deadline a header value names.
+//
+// `GrpcBadTimeout` for anything that is not up to eight digits followed
+// by one of the six unit characters.
+pub fn deadline_of_text(value: Str) -> Result<GrpcDeadline, GrpcDecodeError> []
+    todo("grpcmeta.deadline_of_text")
+
+// How many nanoseconds this deadline is.
+pub fn deadline_nanos(d: GrpcDeadline) -> Int []
+    todo("grpcmeta.deadline_nanos")
+
+// The shortest deadline that spells `nanos` exactly in eight digits or
+// fewer.
+//
+// The unit is chosen so that nothing is rounded: 1,500,000 nanoseconds
+// is `1500u` and not `1m`, because rounding a deadline down cancels
+// work that would have finished and rounding it up outlives the
+// caller.  `GrpcTimeoutTooLong` when no unit spells it exactly within
+// the digit bound.
+//
+// ```novo
+// use grpcmeta
+//
+// fn main() [io]
+//     match grpcmeta.deadline_of_nanos(1500000)
+//         Ok(d)  => println(grpcmeta.deadline_text(d))   // 1500u
+//         Err(e) => println(e.message())
+// ```
+pub fn deadline_of_nanos(nanos: Int) -> Result<GrpcDeadline, GrpcEncodeError> []
+    todo("grpcmeta.deadline_of_nanos")
+
+// What is left of a deadline after `elapsed_nanos`, as nanoseconds, or
+// 0 when it has passed.
+//
+// The arithmetic a PROXY must do: the header is a duration from
+// receipt, so forwarding one unchanged gives the next hop the whole
+// budget again and a chain of five proxies multiplies the deadline by
+// five.  The elapsed time arrives as a parameter because a `core`
+// package has no clock.
+pub fn remaining(d: GrpcDeadline, elapsed_nanos: Int) -> Int []
+    todo("grpcmeta.remaining")
+
+// The header name the deadline travels under: `"grpc-timeout"`.
+pub fn timeout_header() -> Str []
+    todo("grpcmeta.timeout_header")

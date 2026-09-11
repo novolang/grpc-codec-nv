@@ -1,0 +1,68 @@
+[package]
+name        = "grpc-codec-nv"
+version     = "0.0.1"
+description = "gRPC without a socket: the five-byte length-prefixed message framing as a feed-and-drain deframer, the seventeen status codes and the grpc-status trailers as values, metadata and grpc-timeout as values, the application/grpc content-type rules, service descriptors over protobuf-nv's, and one call as a state machine that says what the host must send over an HTTP/2 stream it owns.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: arithmetic over bytes and values the caller already holds.
+# No function declares an effect and there is no socket anywhere in
+# this package — a call is a state machine that takes what arrived and
+# answers what to send, and the host owns the HTTP/2 stream and
+# performs every byte of it.
+#
+# NO DEVICE CLAIM.  gRPC needs HTTP/2, which needs HPACK's dynamic
+# table and per-stream flow control, and a device that could afford
+# those would not be using gRPC.  The README names what an embedded
+# producer should reach for instead.
+layer       = "core"
+
+category    = "networking"
+
+tags = ["grpc", "rpc", "framing", "protobuf", "http2", "sans-io", "status-codes"]
+repository  = "https://github.com/novolang/grpc-codec-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Five bytes in front of every message, and what the host does with them"
+
+[dependencies]
+# protobuf-nv supplies the descriptors a service is described by:
+# `PbService`, `PbMethod` and `PbStreaming` come from there, so a
+# caller that parsed a descriptor set — or fetched one from a
+# reflection service — hands the same values here rather than
+# re-deriving them.
+#
+# A PATH DEPENDENCY WHILE BOTH ARE STAGED IN THIS TREE.  Convert it to
+# the registry range before the first publish:
+#
+#     protobuf-nv = "^0.0.1"
+#
+# `novo pkg publish` refuses the path form, `--dry-run` included, and
+# the refusal is the reminder.  `novo pkg build` is untouched, which is
+# how two packages are developed together.
+protobuf-nv = "^0.0.1"
+
+# NOT http-codec-nv, and the absence is a statement rather than an
+# oversight.  That package is HTTP/1.1, and HTTP/1.1 cannot carry gRPC:
+# the protocol requires trailers on every response, full-duplex streams
+# in both directions at once, and per-stream flow control, and 1.1 has
+# none of the three.  The README's "where HTTP/2 belongs" section says
+# what the missing package is.
+#
+# NOT a compression package.  The compressed flag in the frame header
+# says THAT a message is compressed and `grpc-encoding` says with what;
+# the bytes themselves are the host's to inflate, with flate-nv or
+# whatever the header named.  A codec that compressed would be choosing
+# an algorithm for a protocol whose whole point is that the two ends
+# negotiate one.
