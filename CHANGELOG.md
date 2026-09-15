@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-11
 
 The **interface**, before anyone implements it.  Every signature, every
@@ -54,3 +58,11 @@ package works and calling it panics.
   HPACK's dynamic table and per-stream flow control would not be using
   gRPC.
 - Every value is from `PROTOCOL-HTTP2.md` or `grpc/status.proto`.
+
+### Design notes
+
+- The implementation this interface was checked against is `tonic`
+  (Rust, MIT), whose codec half covers the same ground: the framing,
+  the status codes, the metadata rules and the call state machine.
+  gRPC's own `PROTOCOL-HTTP2.md` and `grpc/status.proto` are the
+  specification.

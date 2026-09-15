@@ -1,6 +1,6 @@
 [package]
 name        = "grpc-codec-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "gRPC without a socket: the five-byte length-prefixed message framing as a feed-and-drain deframer, the seventeen status codes and the grpc-status trailers as values, metadata and grpc-timeout as values, the application/grpc content-type rules, service descriptors over protobuf-nv's, and one call as a state machine that says what the host must send over an HTTP/2 stream it owns.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
