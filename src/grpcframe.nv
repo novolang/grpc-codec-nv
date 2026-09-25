@@ -125,7 +125,7 @@ pub fn framed_len(body_len: Int) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn write_header_into(compressed: Bool, body_len: Int,
-                         mut dst: Cursor) -> Result<Int, GrpcEncodeError> []
+                         var dst: Cursor) -> Result<Int, GrpcEncodeError> []
     todo("grpcframe.write_header_into")
 
 // Read one frame header at `off`.
